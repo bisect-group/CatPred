@@ -18,11 +18,15 @@ from common import (  # noqa: E402
     DEFAULT_SPLIT_GROUPS,
     DEFAULT_VALUE_TYPES,
     ENZYME_FEATURES,
+    DEFAULT_ENSEMBLE_SIZE,
+    DEFAULT_EPOCHS,
     REPO_ROOT,
     default_base_dir,
     default_data_root,
     discover_split_jobs,
     maybe_set_cache_env,
+    run_is_current,
+    run_settings,
     versioned_cache_dir,
 )
 
@@ -186,12 +190,17 @@ def _train_command(job: dict, seed: int, args) -> tuple[list[str], Path]:
     return cmd, out_dir
 
 
+def _is_done(job: dict, out_dir: Path, args) -> bool:
+    splits = (job["train_path"], job["val_path"], job["test_path"])
+    settings = run_settings(args.epochs or DEFAULT_EPOCHS, args.ensemble_size or DEFAULT_ENSEMBLE_SIZE, splits)
+    return run_is_current(out_dir, settings)
+
+
 def _run_train_job(item) -> dict:
-    cmd, out_dir, gpu, env, gpu_semaphore = item
+    cmd, out_dir, gpu, env, gpu_semaphore, done = item
     if _STOP_REQUESTED.is_set():
         return {"out_dir": str(out_dir), "gpu": gpu, "status": "stopped_before_start"}
-    marker = out_dir / "final_results_test.csv"
-    if marker.exists():
+    if done:
         return {"out_dir": str(out_dir), "gpu": gpu, "status": "skipped_complete"}
     env = dict(env)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -271,14 +280,14 @@ def main() -> None:
     for job in jobs:
         for seed in args.seeds:
             cmd, out_dir = _train_command(job, seed, args)
-            done = (out_dir / "final_results_test.csv").exists()
+            done = _is_done(job, out_dir, args)
             gpu = slots[(len(train_items) if done else pending_jobs) % len(slots)]
-            train_items.append((cmd, out_dir, gpu, base_env, gpu_semaphores[gpu]))
+            train_items.append((cmd, out_dir, gpu, base_env, gpu_semaphores[gpu], done))
             pending_jobs += not done
 
     print(f"[launch] train_jobs={len(train_items)} pending_jobs={pending_jobs} gpu_slots={slots}", flush=True)
     if args.dry_run:
-        for cmd, _out_dir, gpu, _env, _sem in train_items:
+        for cmd, _out_dir, gpu, _env, _sem, _done in train_items:
             print(f"[gpu {gpu}] {' '.join(cmd)}")
         return
 

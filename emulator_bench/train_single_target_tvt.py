@@ -18,11 +18,15 @@ from common import (
     configure_cpu_runtime,
     configure_esm_cache_policy,
     configure_torch_runtime,
+    DEFAULT_ENSEMBLE_SIZE,
+    DEFAULT_EPOCHS,
     default_cache_dir,
     drop_unknown_residue_rows,
     ensure_repo_on_path,
     materialize_tabular_as_csv,
     maybe_set_cache_env,
+    run_is_current,
+    run_settings,
     load_molgraph_cache,
     save_molgraph_cache,
     versioned_cache_dir,
@@ -179,7 +183,7 @@ def main():
     parser.add_argument("--metric", default="rmse", type=str)
     parser.add_argument("--extra_metrics", nargs="+", default=["mae", "mse", "r2"])
     parser.add_argument("--seed", default=42, type=int)
-    parser.add_argument("--epochs", default=30, type=int)
+    parser.add_argument("--epochs", default=DEFAULT_EPOCHS, type=int)
     parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--init_lr", default=1e-4, type=float)
     parser.add_argument("--max_lr", default=1e-3, type=float)
@@ -193,7 +197,7 @@ def main():
     parser.add_argument("--add_esm_feats", action="store_true")
     parser.add_argument("--add_pretrained_egnn_feats", action="store_true")
     parser.add_argument("--pretrained_egnn_feats_path", default=str(versioned_cache_dir(default_cache_dir(), "progres") / "progres_egnn_by_structure_id.pt"), type=str)
-    parser.add_argument("--ensemble_size", default=10, type=int)
+    parser.add_argument("--ensemble_size", default=DEFAULT_ENSEMBLE_SIZE, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--grad_accum_steps", default=1, type=int)
     parser.add_argument("--cache_cutoff", default="inf", type=str)
@@ -231,8 +235,8 @@ def main():
     os.environ["CATPRED_TRUSTED_DESERIALIZATION_ROOTS"] = os.pathsep.join(
         [str(Path.cwd()), str(out_dir.resolve()), os.environ.get("CATPRED_TRUSTED_DESERIALIZATION_ROOTS", "")]
     )
-    marker_file = out_dir / f"final_results_{args.resume_marker_split}.csv"
-    if args.resume_if_complete and marker_file.exists():
+    settings = run_settings(args.epochs, args.ensemble_size, (args.train_csv, args.val_csv, args.test_csv))
+    if args.resume_if_complete and run_is_current(out_dir, settings, args.resume_marker_split):
         print(f"Skipping completed run: {out_dir}")
         return
 
@@ -384,6 +388,7 @@ def main():
     ).to_csv(out_dir / "run_summary.csv", index=False)
     with open(out_dir / "time_running.dat", "w") as f:
         f.write(f"{time.time() - start:.4f}\n")
+    write_json(out_dir / "run_settings.json", settings)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from common import (  # noqa: E402
     default_base_dir,
     default_data_root,
     discover_split_jobs,
+    file_signature,
     load_json,
     read_table,
     stable_hash,
@@ -550,6 +551,9 @@ def main() -> None:
                 "limit_rows": args.limit_rows,
                 "identity_threshold": float(args.identity_threshold),
                 "structure": job["value_type"] in args.structure_value_types,
+                "candidate_table": file_signature(data_root / job["value_type"] / f"{job['value_type']}_kinetic_params_3d.parquet")
+                if job["value_type"] in args.structure_value_types
+                else None,
             }
             fingerprint_path = cache_root / "staged_fingerprints" / source.relative_to(data_root).with_suffix(".json")
             if target.exists() and not args.overwrite and _load_json_default(fingerprint_path, None) == fingerprint:

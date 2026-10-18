@@ -117,4 +117,4 @@ Not run: km, other split groups, full-size training.
 - The paper does not state batch size. Code value 16 is used.
 - The paper text says 20 epochs for tuning and 30 for production. 30 is used.
 - `catpred/data/esm_utils.py` imports `emulator_bench.fair_esm_shim`. This was kept.
-- Finished-member reuse and the staging fingerprint ignore `--epochs` and the 3D candidate table. Use a separate `--base_dir` for smoke runs.
+- A finished ensemble is reused only when its `run_settings.json` matches the epochs, ensemble size and staged split files. The staging fingerprint includes the 3D candidate table signature. Runs without `run_settings.json` are retrained.

@@ -369,11 +369,26 @@ def write_json(path: Path, payload) -> None:
     tmp_path.replace(path)
 
 
-def _file_signature(path: str | Path) -> str:
+def file_signature(path: str | Path) -> str:
     resolved = Path(path).expanduser().resolve()
     stat = resolved.stat()
     signature = f"{resolved}:{stat.st_size}:{stat.st_mtime_ns}"
     return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
+
+
+DEFAULT_EPOCHS = 30
+DEFAULT_ENSEMBLE_SIZE = 10
+
+
+def run_settings(epochs: int, ensemble_size: int, split_paths) -> dict:
+    """Settings that change a run's result; the staged split files carry the structure choice."""
+    return {"epochs": epochs, "ensemble_size": ensemble_size, "splits": [file_signature(path) for path in split_paths]}
+
+
+def run_is_current(out_dir: Path, settings: dict, marker_split: str = "test") -> bool:
+    """True when the run finished with these exact settings."""
+    settings_path = out_dir / "run_settings.json"
+    return (out_dir / f"final_results_{marker_split}.csv").exists() and settings_path.exists() and load_json(settings_path) == settings
 
 
 def _molgraph_cache_root(cache_dir: str | None = None) -> Path:
@@ -384,7 +399,7 @@ def _molgraph_cache_root(cache_dir: str | None = None) -> Path:
 
 def molgraph_cache_path(csv_path: str | Path, cache_dir: str | None = None) -> Path:
     """Return the expected on-disk MolGraph cache path for a split CSV."""
-    return _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{_file_signature(csv_path)}.pkl"
+    return _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
 
 
 def _collect_smiles_from_csv(csv_path: str | Path, smiles_columns: list[str]) -> set[str]:
@@ -402,7 +417,7 @@ def _collect_smiles_from_csv(csv_path: str | Path, smiles_columns: list[str]) ->
 def load_molgraph_cache(csv_path: str | Path, smiles_columns: list[str], cache_dir: str | None = None) -> int:
     """Load cached MolGraph objects for this CSV into catpred's in-memory graph cache."""
     try:
-        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{_file_signature(csv_path)}.pkl"
+        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
         if not cache_path.exists():
             return 0
 
@@ -436,7 +451,7 @@ def save_molgraph_cache(csv_path: str | Path, smiles_columns: list[str], cache_d
         if len(subset) == 0:
             return 0
 
-        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{_file_signature(csv_path)}.pkl"
+        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
         tmp_path = cache_path.with_suffix(".tmp.pkl")
         with open(tmp_path, "wb") as f:
             pickle.dump({"graphs": subset}, f, protocol=pickle.HIGHEST_PROTOCOL)
