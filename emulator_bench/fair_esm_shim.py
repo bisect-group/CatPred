@@ -13,7 +13,7 @@ def _vendor_path() -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
 
-    cache_dir = os.getenv("CATPRED_BENCH_CACHE_DIR") or os.getenv("CATPRED_CACHE_PATH")
+    cache_dir = os.getenv("CATPRED_BENCH_CACHE_DIR")
     if cache_dir:
         return (Path(cache_dir).expanduser().resolve() / "fair_esm").resolve()
 

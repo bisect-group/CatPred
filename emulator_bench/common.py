@@ -12,6 +12,7 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EMULATOR_ROOT = REPO_ROOT.parents[1]
 DEFAULT_MODEL_NAME = "CatPred"
+CACHE_VERSION = 3
 DEFAULT_VALUE_TYPES = ("kcat", "km", "ki")
 DEFAULT_SPLIT_GROUPS = (
     "random_splits_grouped_sequence",
@@ -61,11 +62,16 @@ def ensure_repo_on_path() -> None:
 
 
 def default_cache_dir() -> str:
-    env_override = os.getenv("CATPRED_BENCH_CACHE_DIR") or os.getenv("CATPRED_CACHE_PATH")
+    env_override = os.getenv("CATPRED_BENCH_CACHE_DIR")
     if env_override:
         return str(Path(env_override).expanduser().resolve())
 
     return str(default_embeddings_dir().resolve())
+
+
+def versioned_cache_dir(cache_dir: str | Path, name: str) -> Path:
+    """Cache folder whose name holds the cache version, so a bump builds a new cache."""
+    return Path(cache_dir) / f"{name}_v{CACHE_VERSION}"
 
 
 def stable_hash(payload, length: int = 16) -> str:
@@ -205,10 +211,15 @@ def ensure_split_triplet(threshold_dir: Path):
 
 
 def maybe_set_cache_env(cache_dir: str | None):
+    """Point the wrapper caches and upstream catpred's ESM cache into cache_dir. Call before catpred is imported."""
     resolved = str(Path(cache_dir or default_cache_dir()).expanduser().resolve())
-    os.environ["CATPRED_CACHE_PATH"] = resolved
+    os.environ["CATPRED_CACHE_PATH"] = str(versioned_cache_dir(resolved, "catpred_esm"))
     os.environ["CATPRED_BENCH_CACHE_DIR"] = resolved
-    os.environ["CATPRED_BENCH_TABULAR_CACHE_DIR"] = str((Path(resolved) / "tabular_csv").resolve())
+    os.environ["CATPRED_BENCH_TABULAR_CACHE_DIR"] = str(versioned_cache_dir(resolved, "tabular_csv"))
+
+
+# upstream catpred reads CATPRED_CACHE_PATH when it is imported, so set it before any catpred import.
+maybe_set_cache_env(None)
 
 
 def configure_esm_cache_policy(overwrite_esm_cache: bool = False, require_cached_esm: bool = False) -> None:
@@ -219,7 +230,7 @@ def configure_esm_cache_policy(overwrite_esm_cache: bool = False, require_cached
 def _tabular_cache_root(cache_dir: str | None = None) -> Path:
     root = cache_dir or os.getenv("CATPRED_BENCH_TABULAR_CACHE_DIR")
     if root is None:
-        root = Path(default_cache_dir()) / "tabular_csv"
+        root = versioned_cache_dir(default_cache_dir(), "tabular_csv")
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
@@ -366,7 +377,7 @@ def _file_signature(path: str | Path) -> str:
 
 
 def _molgraph_cache_root(cache_dir: str | None = None) -> Path:
-    root = Path(cache_dir or default_cache_dir()).expanduser().resolve() / "molgraph"
+    root = versioned_cache_dir(Path(cache_dir or default_cache_dir()).expanduser().resolve(), "molgraph")
     root.mkdir(parents=True, exist_ok=True)
     return root
 

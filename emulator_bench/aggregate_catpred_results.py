@@ -33,7 +33,6 @@ from common import DEFAULT_SPLIT_GROUPS, DEFAULT_VALUE_TYPES, default_base_dir  
 
 
 TVT_SPLITS = ("train", "val", "test")
-DEFAULT_RUN_NAMES = ("original_defaults",)
 METRIC_ALIASES = {
     "rmse": ("RMSE", "rmse"),
     "mae": ("MAE", "mae"),
@@ -94,7 +93,7 @@ def discover_split_dirs(
             if split_group not in selected_groups:
                 continue
 
-            split_name = rel_parts[-1]
+            split_name = rel_parts[-1] if len(rel_parts) > 1 else "all"
             threshold = split_name if split_name.startswith("threshold_") else None
             rows.append(
                 {
@@ -103,31 +102,16 @@ def discover_split_dirs(
                     "threshold": threshold,
                     "split_name": split_name,
                     "split_dir": split_dir,
+                    "run_dir": value_root / split_group / split_name,
                 }
             )
 
     return sorted(rows, key=lambda row: (row["value_type"], _split_sort_key(row["split_group"]), row["split_name"]))
 
 
-def discover_run_names(split_rows: list[dict]) -> list[str]:
-    names = set()
-    for row in split_rows:
-        results_dir = row["split_dir"] / "catpred_results"
-        if not results_dir.exists():
-            continue
-        names.update(path.name for path in results_dir.iterdir() if path.is_dir())
-    return sorted(names)
-
-
-def discover_expected_seeds(split_rows: list[dict], run_names: Iterable[str]) -> dict[str, list[str]]:
-    expected: dict[str, set[str]] = {run_name: set() for run_name in run_names}
-    for row in split_rows:
-        for run_name in run_names:
-            run_dir = row["split_dir"] / "catpred_results" / run_name
-            if not run_dir.exists():
-                continue
-            expected[run_name].update(path.name for path in run_dir.glob("seed_*") if path.is_dir())
-    return {run_name: sorted(seeds, key=_seed_sort_key) for run_name, seeds in expected.items()}
+def discover_expected_seeds(split_rows: list[dict]) -> list[str]:
+    seeds = {path.name for row in split_rows if row["run_dir"].exists() for path in row["run_dir"].glob("seed_*") if path.is_dir()}
+    return sorted(seeds, key=_seed_sort_key)
 
 
 def _first_existing(series: pd.Series, aliases: tuple[str, ...]) -> float | None:
@@ -203,92 +187,83 @@ def load_split_metrics(seed_dir: Path, tvt_split: str) -> tuple[dict[str, float]
 
 def build_rows(
     split_rows: list[dict],
-    run_names: list[str],
-    expected_seeds: dict[str, list[str]],
+    expected_seeds: list[str],
     allow_partial_seeds: bool,
 ) -> tuple[list[dict], list[dict]]:
     result_rows = []
     missing_rows = []
 
     for split_row in split_rows:
-        split_dir = split_row["split_dir"]
-        for run_name in run_names:
-            run_dir = split_dir / "catpred_results" / run_name
-            seeds = expected_seeds.get(run_name, [])
-            if not seeds and run_dir.exists():
-                seeds = sorted((path.name for path in run_dir.glob("seed_*") if path.is_dir()), key=_seed_sort_key)
+        run_dir = split_row["run_dir"]
+        ident = {key: value for key, value in split_row.items() if key not in ("split_dir", "run_dir")}
+        seeds = expected_seeds or sorted((path.name for path in run_dir.glob("seed_*") if path.is_dir()), key=_seed_sort_key)
 
-            if not seeds:
+        if not seeds:
+            missing_rows.append(
+                {
+                    **ident,
+                    "seed": None,
+                    "seed_int": None,
+                    "tvt_split": None,
+                    "status": "missing_seed_dirs",
+                    "missing_files": "seed_*",
+                    "seed_dir": str(run_dir),
+                }
+            )
+            continue
+
+        for seed in seeds:
+            seed_dir = run_dir / seed
+            if not seed_dir.exists():
                 missing_rows.append(
                     {
-                        **{key: value for key, value in split_row.items() if key != "split_dir"},
-                        "run_name": run_name,
-                        "seed": None,
-                        "seed_int": None,
+                        **ident,
+                        "seed": seed,
+                        "seed_int": _seed_int(seed),
                         "tvt_split": None,
-                        "status": "missing_seed_dirs",
-                        "missing_files": "seed_*",
-                        "seed_dir": str(run_dir),
+                        "status": "missing_seed_dir",
+                        "missing_files": "seed_dir",
+                        "seed_dir": str(seed_dir),
                     }
                 )
                 continue
 
-            for seed in seeds:
-                seed_dir = run_dir / seed
-                if not seed_dir.exists():
-                    missing_rows.append(
-                        {
-                            **{key: value for key, value in split_row.items() if key != "split_dir"},
-                            "run_name": run_name,
-                            "seed": seed,
-                            "seed_int": _seed_int(seed),
-                            "tvt_split": None,
-                            "status": "missing_seed_dir",
-                            "missing_files": "seed_dir",
-                            "seed_dir": str(seed_dir),
-                        }
-                    )
-                    continue
+            seed_split_metrics = {}
+            seed_missing = {}
+            for tvt_split in TVT_SPLITS:
+                metrics, missing = load_split_metrics(seed_dir, tvt_split)
+                if metrics:
+                    seed_split_metrics[tvt_split] = metrics
+                if missing:
+                    seed_missing[tvt_split] = missing
 
-                seed_split_metrics = {}
-                seed_missing = {}
-                for tvt_split in TVT_SPLITS:
-                    metrics, missing = load_split_metrics(seed_dir, tvt_split)
-                    if metrics:
-                        seed_split_metrics[tvt_split] = metrics
-                    if missing:
-                        seed_missing[tvt_split] = missing
-
-                is_complete = set(seed_split_metrics) == set(TVT_SPLITS) and not seed_missing
-                if seed_missing:
-                    for tvt_split, missing in seed_missing.items():
-                        missing_rows.append(
-                            {
-                                **{key: value for key, value in split_row.items() if key != "split_dir"},
-                                "run_name": run_name,
-                                "seed": seed,
-                                "seed_int": _seed_int(seed),
-                                "tvt_split": tvt_split,
-                                "status": "incomplete_seed",
-                                "missing_files": ";".join(missing),
-                                "seed_dir": str(seed_dir),
-                            }
-                        )
-
-                if not is_complete and not allow_partial_seeds:
-                    continue
-
-                for tvt_split, metrics in seed_split_metrics.items():
-                    row = {
-                        **{key: value for key, value in split_row.items() if key != "split_dir"},
-                        "run_name": run_name,
+            is_complete = set(seed_split_metrics) == set(TVT_SPLITS) and not seed_missing
+            for tvt_split, missing in seed_missing.items():
+                missing_rows.append(
+                    {
+                        **ident,
                         "seed": seed,
                         "seed_int": _seed_int(seed),
                         "tvt_split": tvt_split,
+                        "status": "incomplete_seed",
+                        "missing_files": ";".join(missing),
                         "seed_dir": str(seed_dir),
                     }
-                    row.update(metrics)
-                    result_rows.append(row)
+                )
+
+            if not is_complete and not allow_partial_seeds:
+                continue
+
+            for tvt_split, metrics in seed_split_metrics.items():
+                row = {
+                    **ident,
+                    "seed": seed,
+                    "seed_int": _seed_int(seed),
+                    "tvt_split": tvt_split,
+                    "seed_dir": str(seed_dir),
+                }
+                row.update(metrics)
+                result_rows.append(row)
 
     return result_rows, missing_rows
 
@@ -298,7 +273,7 @@ def aggregate(result_rows: list[dict]) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(result_rows)
-    group_keys = ["value_type", "run_name", "split_group", "threshold", "split_name", "tvt_split"]
+    group_keys = ["value_type", "split_group", "threshold", "split_name", "tvt_split"]
     present_metrics = [metric for metric in METRICS if metric in df.columns]
     agg = df.groupby(group_keys, dropna=False)[present_metrics].agg(["mean", "std"])
     agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
@@ -313,8 +288,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base_dir", type=Path, default=default_base_dir())
     parser.add_argument("--value_types", nargs="+", default=list(DEFAULT_VALUE_TYPES))
     parser.add_argument("--split_groups", nargs="+", default=list(DEFAULT_SPLIT_GROUPS))
-    parser.add_argument("--run_names", nargs="+", default=list(DEFAULT_RUN_NAMES))
-    parser.add_argument("--all_run_names", action="store_true", help="Aggregate every run name found under catpred_results.")
     parser.add_argument("--seeds", nargs="+", default=None, help="Expected seed names or integers, e.g. 666 777 888.")
     parser.add_argument("--allow_partial_seeds", action="store_true", help="Include available TVT files even when a seed is missing another TVT file.")
     parser.add_argument("--output", type=Path, default=None)
@@ -337,25 +310,13 @@ def main() -> None:
     if not split_rows:
         raise FileNotFoundError(f"No CatPred split directories found under {base_dir}")
 
-    run_names = discover_run_names(split_rows) if args.all_run_names else list(args.run_names)
-    if not run_names:
-        print("No CatPred run names found.")
-        return
-
     if args.seeds:
-        expected_seeds = {
-            run_name: sorted(
-                {seed if str(seed).startswith("seed_") else f"seed_{seed}" for seed in args.seeds},
-                key=_seed_sort_key,
-            )
-            for run_name in run_names
-        }
+        expected_seeds = sorted({seed if str(seed).startswith("seed_") else f"seed_{seed}" for seed in args.seeds}, key=_seed_sort_key)
     else:
-        expected_seeds = discover_expected_seeds(split_rows, run_names)
+        expected_seeds = discover_expected_seeds(split_rows)
 
     result_rows, missing_rows = build_rows(
         split_rows=split_rows,
-        run_names=run_names,
         expected_seeds=expected_seeds,
         allow_partial_seeds=args.allow_partial_seeds,
     )

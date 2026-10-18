@@ -25,6 +25,7 @@ from common import (
     maybe_set_cache_env,
     load_molgraph_cache,
     save_molgraph_cache,
+    versioned_cache_dir,
     write_json,
 )
 from predict_single_target import evaluate_predictions_csv
@@ -191,7 +192,7 @@ def main():
     parser.add_argument("--sequence_max_length", default=2048, type=int)
     parser.add_argument("--add_esm_feats", action="store_true")
     parser.add_argument("--add_pretrained_egnn_feats", action="store_true")
-    parser.add_argument("--pretrained_egnn_feats_path", default=str(Path(default_cache_dir()) / "progres" / "progres_egnn_by_structure_id.pt"), type=str)
+    parser.add_argument("--pretrained_egnn_feats_path", default=str(versioned_cache_dir(default_cache_dir(), "progres") / "progres_egnn_by_structure_id.pt"), type=str)
     parser.add_argument("--ensemble_size", default=10, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--grad_accum_steps", default=1, type=int)

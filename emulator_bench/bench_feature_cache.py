@@ -6,11 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from common import default_cache_dir
+from common import default_cache_dir, versioned_cache_dir
 
 
 _MEM_CACHE = OrderedDict()
-_CACHE_VERSION = "esm2_t33_650M_UR50D_v2"
+_ESM_MODEL = "esm2_t33_650M_UR50D"
 _WARNED_RECOVERY_KEYS = set()
 
 
@@ -32,22 +32,20 @@ def _mem_cache_limit(default: int = 128) -> int:
 
 
 def _cache_root(cache_dir: str | None = None) -> Path:
-    root = cache_dir or os.getenv("CATPRED_BENCH_CACHE_DIR") or os.getenv("CATPRED_CACHE_PATH")
-    if root is None:
-        root = default_cache_dir()
+    root = cache_dir or default_cache_dir()
     root = Path(root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def esm_cache_dir(cache_dir: str | None = None) -> Path:
-    path = _cache_root(cache_dir) / "esm2"
+    path = versioned_cache_dir(_cache_root(cache_dir), _ESM_MODEL)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def esm_cache_key(sequence: str) -> str:
-    return hashlib.sha256(f"{_CACHE_VERSION}|{sequence}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{_ESM_MODEL}|{sequence}".encode("utf-8")).hexdigest()
 
 
 def esm_cache_path(sequence: str, cache_dir: str | None = None) -> Path:

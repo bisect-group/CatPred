@@ -10,7 +10,7 @@ import torch
 
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
-from bench_feature_cache import load_cached_esm, save_cached_esm
+from bench_feature_cache import esm_cache_dir, load_cached_esm, save_cached_esm
 from common import (
     configure_esm_cache_policy,
     default_cache_dir,
@@ -157,7 +157,7 @@ def _run_parallel_esm_workers(
     shards = [missing[i::shard_count] for i in range(shard_count)]
     print(f"[cache] launching {shard_count} ESM warmup workers across GPUs {gpu_ids[:shard_count]}", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix="catpred_esm_warm_") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="catpred_esm_warm_", dir=esm_cache_dir(cache_dir)) as tmpdir:
         procs = []
         for worker_idx, shard in enumerate(shards):
             gpu_id = gpu_ids[worker_idx]

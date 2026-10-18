@@ -22,6 +22,8 @@ from common import (  # noqa: E402
     default_base_dir,
     default_data_root,
     discover_split_jobs,
+    maybe_set_cache_env,
+    versioned_cache_dir,
 )
 
 ALIGN_SCRIPT = HERE / "align_structures.py"
@@ -156,7 +158,8 @@ def _run_prepare_steps(args, gpus: list[str]) -> None:
 
 
 def _train_command(job: dict, seed: int, args) -> tuple[list[str], Path]:
-    out_dir = Path(job["threshold_dir"]) / "catpred_results" / args.run_name / f"seed_{seed}"
+    split_name = "all" if job["threshold"] == "default" else job["threshold"]
+    out_dir = Path(args.base_dir) / job["value_type"] / job["split_group"] / split_name / f"seed_{seed}"
     cmd = [
         sys.executable, str(TRAIN_SCRIPT),
         "--train_csv", job["train_path"],
@@ -168,7 +171,7 @@ def _train_command(job: dict, seed: int, args) -> tuple[list[str], Path]:
         "--num_workers", str(args.num_workers),
         "--device", "cuda:0",
         "--cache_dir", args.cache_dir,
-        "--mixed_precision", args.mixed_precision,
+        "--mixed_precision", "bf16" if args.amp else "none",
         "--resume_if_complete",
         "--require_cached_esm",
     ]
@@ -179,7 +182,7 @@ def _train_command(job: dict, seed: int, args) -> tuple[list[str], Path]:
     if ENZYME_FEATURES[job["value_type"]] == "esm":
         cmd.append("--add_esm_feats")
     else:
-        cmd.extend(["--add_pretrained_egnn_feats", "--pretrained_egnn_feats_path", str(Path(args.cache_dir) / "progres" / "progres_egnn_by_structure_id.pt")])
+        cmd.extend(["--add_pretrained_egnn_feats", "--pretrained_egnn_feats_path", str(versioned_cache_dir(args.cache_dir, "progres") / "progres_egnn_by_structure_id.pt")])
     return cmd, out_dir
 
 
@@ -227,15 +230,14 @@ def main() -> None:
     parser.add_argument("--split_groups", nargs="+", default=list(DEFAULT_SPLIT_GROUPS))
     parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--gpus", nargs="+", default=["0"], help="Physical GPU ids, for example --gpus 0 1 or --gpus 0,1")
-    parser.add_argument("--max_parallel_per_gpu", default=1, type=int)
+    parser.add_argument("--runs_per_gpu", default=1, type=int, help="Concurrent training runs per GPU.")
     parser.add_argument("--seeds", nargs="+", default=[666, 777, 888], type=int)
     parser.add_argument("--cache_dir", default=None, type=str, help="Default: <base_dir>/embeddings.")
-    parser.add_argument("--run_name", default="original_defaults", type=str)
     parser.add_argument("--epochs", default=None, type=int, help="Smoke tests only. Default is the original 30.")
     parser.add_argument("--ensemble_size", default=None, type=int, help="Smoke tests only. Default is the original 10.")
     parser.add_argument("--limit_rows", default=None, type=int, help="Smoke tests only. Stage the first N rows of each split.")
     parser.add_argument("--num_workers", default=0, type=int)
-    parser.add_argument("--mixed_precision", choices=["auto", "none", "bf16", "fp16"], default="none")
+    parser.add_argument("--amp", action="store_true", help="Train with bf16 mixed precision (--mixed_precision bf16). Default: fp32, as in the original.")
     parser.add_argument("--skip_align", action="store_true")
     parser.add_argument("--skip_embeddings", action="store_true")
     parser.add_argument("--overwrite_align", action="store_true")
@@ -250,6 +252,7 @@ def main() -> None:
     args.data_root = str(Path(args.data_root).expanduser().resolve())
     args.base_dir = str(Path(args.base_dir).expanduser().resolve())
     args.cache_dir = str(Path(args.cache_dir or Path(args.base_dir) / "embeddings").expanduser().resolve())
+    maybe_set_cache_env(args.cache_dir)
 
     _run_prepare_steps(args, gpus)
 
@@ -260,7 +263,7 @@ def main() -> None:
         thresholds=args.thresholds,
     )
     base_env = os.environ.copy()
-    per_gpu_limit = max(1, args.max_parallel_per_gpu)
+    per_gpu_limit = max(1, args.runs_per_gpu)
     gpu_semaphores = {gpu: threading.BoundedSemaphore(per_gpu_limit) for gpu in gpus}
     slots = gpus * per_gpu_limit
     train_items = []

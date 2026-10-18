@@ -13,6 +13,9 @@ $PY emulator_bench/launch_parallel_retrain.py --dry_run
 #    Stages the splits, builds the caches, trains, and resumes finished runs.
 $PY emulator_bench/launch_parallel_retrain.py --gpus 0 1
 
+#    Multi-GPU: GPUs 0 1, two runs per GPU, bf16 mixed precision.
+$PY emulator_bench/launch_parallel_retrain.py --gpus 0 1 --runs_per_gpu 2 --amp
+
 # 3) One task and one split, one seed.
 $PY emulator_bench/launch_parallel_retrain.py --gpus 0 --value_types kcat \
   --split_groups random_splits_grouped_sequence --seeds 666

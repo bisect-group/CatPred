@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from bench_feature_cache import esm_cache_dir  # noqa: E402
 from build_tvt_data import warm_esm_cache_allow_missing  # noqa: E402
 from common import (  # noqa: E402
     DEFAULT_SPLIT_GROUPS,
@@ -28,6 +29,7 @@ from common import (  # noqa: E402
     STRUCTURE_COLUMNS,
     default_base_dir,
     default_cache_dir,
+    versioned_cache_dir,
     discover_split_jobs,
     maybe_set_cache_env,
     read_table,
@@ -165,7 +167,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir).expanduser().resolve()
-    progres_dir = cache_dir / "progres"
+    progres_dir = versioned_cache_dir(cache_dir, "progres")
     filepaths = progres_dir / "filepaths.txt"
     searchdb = progres_dir / "searchdb.pt"
     catpred_egnn = progres_dir / "progres_egnn_by_structure_id.pt"
@@ -193,7 +195,7 @@ def main() -> None:
             "progres_filepaths": str(filepaths),
             "progres_searchdb": str(searchdb),
             "pretrained_egnn_feats_path": str(catpred_egnn),
-            "esm_cache_dir": str(cache_dir / "esm2"),
+            "esm_cache_dir": str(esm_cache_dir(str(cache_dir))),
             "structure_columns": list(STRUCTURE_COLUMNS),
         },
     )

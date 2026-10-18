@@ -80,7 +80,7 @@ Sequences with unknown residues in the 1d tables (unique sequences, all splits):
 | km | 147 | 29,085 | B, O, U, X, Z |
 | ki | 29 | 5,938 | B, O, U, X |
 
-The ESM and molgraph caches need no version bump. Their keys are the sequence and the input file signature. A filtered file has its own signature.
+The ESM and molgraph caches live in versioned folders (cache version 3). Their keys are the sequence and the input file signature. A filtered file has its own signature.
 Check: a 62/16/15 smoke run with 2 train and 1 test rows changed to `X` dropped 2, 0 and 1 rows. The 64/16/16 comparison drops none and still matches the original bit for bit.
 
 ## Commands

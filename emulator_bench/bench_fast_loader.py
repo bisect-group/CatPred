@@ -16,7 +16,7 @@ except ModuleNotFoundError:
     from src.utils.rich_progress import progress
 
 from bench_feature_cache import get_or_compute_esm
-from common import default_cache_dir, materialize_tabular_as_csv
+from common import default_cache_dir, materialize_tabular_as_csv, versioned_cache_dir
 
 
 INLINE_PROTEIN_SENTINEL = "__bench_inline_protein__"
@@ -47,12 +47,7 @@ def _resolve_protein_id_column(requested_col: str, fieldnames: List[str]) -> str
 
 
 def _cache_root() -> Path:
-    root = os.getenv("CATPRED_BENCH_CACHE_DIR") or os.getenv("CATPRED_CACHE_PATH")
-    if root is None:
-        root_path = Path(default_cache_dir())
-    else:
-        root_path = Path(root).expanduser().resolve()
-    path = root_path / "dataset_inline"
+    path = versioned_cache_dir(Path(default_cache_dir()).expanduser().resolve(), "dataset_inline")
     path.mkdir(parents=True, exist_ok=True)
     return path
 
