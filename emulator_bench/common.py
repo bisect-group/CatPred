@@ -1,7 +1,6 @@
 import json
 import os
 import hashlib
-import shutil
 import sys
 import csv
 import pickle
@@ -11,6 +10,7 @@ import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+EMULATOR_ROOT = REPO_ROOT.parents[1]
 DEFAULT_MODEL_NAME = "CatPred"
 DEFAULT_VALUE_TYPES = ("kcat", "km", "ki")
 DEFAULT_SPLIT_GROUPS = (
@@ -18,10 +18,11 @@ DEFAULT_SPLIT_GROUPS = (
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
-    "enzyme_structure_splits",
     "substrate_splits",
-    "conformer_cosine_splits",
 )
+# Enzyme feature set of the released CatPred models: Seq-Attn + ESM2 for kcat and Km,
+# Seq-Attn + proGRES (E-GNN) for Ki (scripts/reproduce_fig5_catpred.sh).
+ENZYME_FEATURES = {"kcat": "esm", "km": "esm", "ki": "egnn"}
 KEY_COLUMNS = ("smiles", "sequence", "value", "smiles_hash", "uniprot_date", "log10_value")
 STRUCTURE_COLUMNS = (
     "pdbs",
@@ -37,26 +38,21 @@ STRUCTURE_COLUMNS = (
 )
 
 
+def default_data_root() -> Path:
+    """Kinetic dataset root that holds the kcat, km and ki split folders."""
+    return EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
+
+
 def default_base_dir() -> Path:
-    env_override = os.getenv("CATPRED_BENCH_BASE_DIR") or os.getenv("EMULATOR_CATPRED_DATA_DIR")
+    """Work tree with the staged splits, caches and results. Never inside the dataset tree."""
+    env_override = os.getenv("CATPRED_BENCH_BASE_DIR")
     if env_override:
         return Path(env_override).expanduser().resolve()
-    return (
-        REPO_ROOT.parent
-        / "EMULaToR"
-        / "data"
-        / "processed"
-        / "baselines"
-        / DEFAULT_MODEL_NAME
-    ).resolve()
+    return EMULATOR_ROOT / "outputs" / "baselines" / DEFAULT_MODEL_NAME
 
 
 def default_embeddings_dir() -> Path:
     return default_base_dir() / "embeddings"
-
-
-def default_features_dir() -> Path:
-    return default_base_dir() / "features"
 
 
 def ensure_repo_on_path() -> None:
@@ -65,16 +61,11 @@ def ensure_repo_on_path() -> None:
 
 
 def default_cache_dir() -> str:
-    # Keep all benchmark caches under the EMULaToR processed baseline tree when available.
     env_override = os.getenv("CATPRED_BENCH_CACHE_DIR") or os.getenv("CATPRED_CACHE_PATH")
     if env_override:
         return str(Path(env_override).expanduser().resolve())
 
-    external_cache = default_embeddings_dir()
-    if external_cache.parent.exists():
-        return str(external_cache.resolve())
-
-    return str((REPO_ROOT / "emulator_bench" / ".cache_embeddings").resolve())
+    return str(default_embeddings_dir().resolve())
 
 
 def stable_hash(payload, length: int = 16) -> str:
@@ -194,10 +185,6 @@ def discover_threshold_dirs(value_root: Path, split_groups, explicit_thresholds=
     return jobs
 
 
-def ensure_csv_triplet(threshold_dir: Path):
-    return ensure_split_triplet(threshold_dir)
-
-
 def split_file(threshold_dir: Path, split_name: str):
     for ext in (".csv", ".parquet"):
         candidate = threshold_dir / f"{split_name}{ext}"
@@ -215,48 +202,6 @@ def ensure_split_triplet(threshold_dir: Path):
     val_path = split_file(threshold_dir, "val")
     test_path = split_file(threshold_dir, "test")
     return train_path, val_path, test_path
-
-
-def threshold_to_float(name: str):
-    try:
-        return float(str(name).split("threshold_")[-1])
-    except Exception:
-        return float("inf")
-
-
-def slug(text: str) -> str:
-    return str(text).replace("/", "_").replace(" ", "_")
-
-
-def get_split_meta(train_csv: Path, val_csv: Path, test_csv: Path, ratio_tolerance: float):
-    train_size = len(load_tabular_dataframe(train_csv))
-    val_size = len(load_tabular_dataframe(val_csv))
-    test_size = len(load_tabular_dataframe(test_csv))
-    total = train_size + val_size + test_size
-
-    if total == 0:
-        train_ratio = val_ratio = test_ratio = 0.0
-    else:
-        train_ratio = train_size / total
-        val_ratio = val_size / total
-        test_ratio = test_size / total
-
-    target = (0.8, 0.1, 0.1)
-    small_split_flag = int(
-        abs(train_ratio - target[0]) > ratio_tolerance
-        or abs(val_ratio - target[1]) > ratio_tolerance
-        or abs(test_ratio - target[2]) > ratio_tolerance
-    )
-
-    return {
-        "train_size": train_size,
-        "val_size": val_size,
-        "test_size": test_size,
-        "train_ratio": train_ratio,
-        "val_ratio": val_ratio,
-        "test_ratio": test_ratio,
-        "small_split_flag": small_split_flag,
-    }
 
 
 def maybe_set_cache_env(cache_dir: str | None):
@@ -302,6 +247,22 @@ def materialize_tabular_as_csv(path: str | Path, cache_dir: str | None = None) -
     return str(out_path)
 
 
+# Residues accepted by seq_to_tensor in catpred/models/model.py. Any other letter raises KeyError there.
+ORIGINAL_AA_VOCAB = frozenset("ACDQKIPTFGHELRWVNYMS")
+
+
+def drop_unknown_residue_rows(csv_path: str | Path, sequence_col: str, out_path: Path) -> tuple[str, int]:
+    """Write the rows the original model can featurize to out_path. Return its path and the dropped row count."""
+    df = pd.read_csv(csv_path)
+    keep = df[sequence_col].map(lambda seq: set(str(seq).strip()) <= ORIGINAL_AA_VOCAB)
+    dropped = int((~keep).sum())
+    if dropped == 0:
+        return str(csv_path), 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df[keep].to_csv(out_path, index=False)
+    return str(out_path), dropped
+
+
 def load_tabular_dataframe(path: str | Path, usecols=None) -> pd.DataFrame:
     input_path = Path(path).expanduser().resolve()
     suffix = input_path.suffix.lower()
@@ -338,7 +299,7 @@ def iter_tabular_rows(path: str | Path):
         yield row
 
 
-def configure_torch_runtime(device: str, enable_tf32: bool = True) -> None:
+def configure_torch_runtime(device: str, enable_tf32: bool = False) -> None:
     if "cuda" not in str(device).lower():
         return
 
@@ -354,17 +315,6 @@ def configure_torch_runtime(device: str, enable_tf32: bool = True) -> None:
 
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = True
-
-    # Explicitly enable the scaled-dot-product attention backends when available.
-    # Bench protein attention does not require attention weights, so these kernels
-    # can reduce memory traffic and improve GPU utilization.
-    if hasattr(torch.backends, "cuda"):
-        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-            torch.backends.cuda.enable_flash_sdp(True)
-        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-        if hasattr(torch.backends.cuda, "enable_math_sdp"):
-            torch.backends.cuda.enable_math_sdp(True)
 
 
 def configure_cpu_runtime(
@@ -406,12 +356,6 @@ def write_json(path: Path, payload) -> None:
     with open(tmp_path, "w") as f:
         json.dump(payload, f, indent=2)
     tmp_path.replace(path)
-
-
-def copy_if_missing(src: Path, dst: Path):
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if not dst.exists():
-        shutil.copy2(src, dst)
 
 
 def _file_signature(path: str | Path) -> str:

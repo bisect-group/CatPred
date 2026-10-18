@@ -10,10 +10,8 @@ import pandas as pd
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 from bench_amp import install_amp_patches
-from bench_dataloader import install_dataloader_patches
 from bench_fast_loader import INLINE_PROTEIN_SENTINEL, install_bench_patches
 from bench_optimizer import install_optimizer_patches
-from bench_scheduler import install_scheduler_patches
 from bench_speedups import install_model_speed_patches
 from bench_training_control import install_training_control_patches
 from common import (
@@ -21,13 +19,12 @@ from common import (
     configure_esm_cache_policy,
     configure_torch_runtime,
     default_cache_dir,
+    drop_unknown_residue_rows,
     ensure_repo_on_path,
     materialize_tabular_as_csv,
     maybe_set_cache_env,
     load_molgraph_cache,
-    molgraph_cache_path,
     save_molgraph_cache,
-    warm_molgraph_cache,
     write_json,
 )
 from predict_single_target import evaluate_predictions_csv
@@ -92,7 +89,7 @@ def build_catpred_train_argv(args):
         argv.append("--add_esm_feats")
     if args.add_pretrained_egnn_feats:
         argv.extend(["--add_pretrained_egnn_feats", "--pretrained_egnn_feats_path", args.pretrained_egnn_feats_path])
-    if args.low_ram_mode or args.cache_batch_graphs:
+    if args.low_ram_mode:
         argv.append("--no_cache_mol")
     return argv
 
@@ -110,12 +107,6 @@ def _auto_esm_mem_cache_max(ram_budget_gb: float) -> int:
     per_entry_mb = 2.0
     estimated_entries = int(cache_budget_mb / per_entry_mb)
     return max(64, min(1024, estimated_entries))
-
-
-def _effective_low_ram_mode(args) -> bool:
-    if bool(getattr(args, "disable_low_ram_mode", False)):
-        return False
-    return bool(getattr(args, "low_ram_mode", False))
 
 
 def _run_single_training(parsed_args, run_training):
@@ -188,7 +179,7 @@ def main():
     parser.add_argument("--extra_metrics", nargs="+", default=["mae", "mse", "r2"])
     parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--epochs", default=30, type=int)
-    parser.add_argument("--batch_size", default=32, type=int)
+    parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--init_lr", default=1e-4, type=float)
     parser.add_argument("--max_lr", default=1e-3, type=float)
     parser.add_argument("--final_lr", default=1e-4, type=float)
@@ -198,8 +189,8 @@ def main():
     parser.add_argument("--seq_embed_dim", default=36, type=int)
     parser.add_argument("--seq_self_attn_nheads", default=6, type=int)
     parser.add_argument("--sequence_max_length", default=2048, type=int)
-    parser.add_argument("--add_esm_feats", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--add_pretrained_egnn_feats", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--add_esm_feats", action="store_true")
+    parser.add_argument("--add_pretrained_egnn_feats", action="store_true")
     parser.add_argument("--pretrained_egnn_feats_path", default=str(Path(default_cache_dir()) / "progres" / "progres_egnn_by_structure_id.pt"), type=str)
     parser.add_argument("--ensemble_size", default=10, type=int)
     parser.add_argument("--num_workers", default=4, type=int)
@@ -207,26 +198,13 @@ def main():
     parser.add_argument("--cache_cutoff", default="inf", type=str)
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--cache_dir", default=default_cache_dir(), type=str)
-    parser.add_argument("--prefetch_factor", default=4, type=int)
-    parser.add_argument("--disable_pin_memory", action="store_true")
-    parser.add_argument("--disable_persistent_workers", action="store_true")
-    parser.add_argument("--smart_batching", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--bucket_multiplier", default=50, type=int)
-    parser.add_argument("--cache_batch_graphs", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--mixed_precision", choices=["auto", "none", "bf16", "fp16"], default="auto")
-    parser.add_argument("--optimizer_fused", choices=["auto", "on", "off"], default="auto")
-    parser.add_argument("--lr_scheduler", choices=["cosine_warmup", "noam"], default="cosine_warmup")
-    parser.add_argument("--val_every_n_epochs", default=1, type=int)
-    parser.add_argument("--final_epoch_metrics_only", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--early_stopping_patience", default=4, type=int)
-    parser.add_argument("--early_stopping_min_delta", default=0.0, type=float)
+    parser.add_argument("--mixed_precision", choices=["auto", "none", "bf16", "fp16"], default="none")
+    parser.add_argument("--optimizer_fused", choices=["auto", "on", "off"], default="off")
     parser.add_argument("--overwrite_esm_cache", action="store_true")
     parser.add_argument("--require_cached_esm", action="store_true")
     parser.add_argument("--disable_lazy_esm", action="store_true")
     parser.add_argument("--disable_dataset_cache", action="store_true")
-    parser.add_argument("--strict_precompute", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--low_ram_mode", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--disable_low_ram_mode", action="store_true")
     parser.add_argument("--esm_mem_cache_max", default=None, type=int)
     parser.add_argument("--ram_budget_gb", default=90.0, type=float)
     parser.add_argument("--cpu_threads", default=None, type=int)
@@ -237,18 +215,21 @@ def main():
         type=int,
         help="Call torch.cuda.empty_cache() every N batches in train/validation/predict loops. 0 disables it.",
     )
-    parser.add_argument("--disable_tf32", action="store_true")
+    parser.add_argument("--tf32", action="store_true")
     parser.add_argument("--resume_if_complete", action="store_true")
     parser.add_argument("--resume_marker_split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--skip_train_eval_after_fit", action="store_true")
     parser.add_argument("--skip_val_eval_after_fit", action="store_true")
     parser.add_argument("--skip_test_eval_after_fit", action="store_true")
-    parser.add_argument("--skip_native_test_eval", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable_molgraph_disk_cache", action="store_true")
     args, passthrough = parser.parse_known_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Checkpoints are written under out_dir, which may be outside the repository.
+    os.environ["CATPRED_TRUSTED_DESERIALIZATION_ROOTS"] = os.pathsep.join(
+        [str(Path.cwd()), str(out_dir.resolve()), os.environ.get("CATPRED_TRUSTED_DESERIALIZATION_ROOTS", "")]
+    )
     marker_file = out_dir / f"final_results_{args.resume_marker_split}.csv"
     if args.resume_if_complete and marker_file.exists():
         print(f"Skipping completed run: {out_dir}")
@@ -262,14 +243,12 @@ def main():
     effective_esm_mem_cache_max = args.esm_mem_cache_max
     if effective_esm_mem_cache_max is None:
         effective_esm_mem_cache_max = _auto_esm_mem_cache_max(args.ram_budget_gb)
-    effective_low_ram_mode = _effective_low_ram_mode(args)
-    if args.strict_precompute and args.add_esm_feats:
+    if args.add_esm_feats:
         args.require_cached_esm = True
 
     os.environ["CATPRED_BENCH_LAZY_ESM"] = "0" if args.disable_lazy_esm else "1"
     os.environ["CATPRED_BENCH_DATASET_CACHE"] = "0" if args.disable_dataset_cache else "1"
-    os.environ["CATPRED_BENCH_STRICT_PRECOMPUTE"] = "1" if args.strict_precompute else "0"
-    os.environ["CATPRED_BENCH_RECOVER_MISSING_ESM"] = "0" if args.strict_precompute else "1"
+    os.environ["CATPRED_BENCH_RECOVER_MISSING_ESM"] = "0"
     os.environ["CATPRED_BENCH_ESM_MEM_CACHE_MAX"] = str(max(1, int(effective_esm_mem_cache_max)))
     os.environ["CATPRED_BENCH_RAM_BUDGET_GB"] = str(max(1.0, float(args.ram_budget_gb)))
     os.environ["CATPRED_BENCH_CUDA_EMPTY_CACHE_INTERVAL"] = str(max(0, int(args.cuda_empty_cache_interval)))
@@ -278,34 +257,24 @@ def main():
         require_cached_esm=args.require_cached_esm,
     )
     ensure_repo_on_path()
-    configure_torch_runtime(args.device, enable_tf32=not args.disable_tf32)
+    configure_torch_runtime(args.device, enable_tf32=args.tf32)
 
     train_csv = materialize_tabular_as_csv(args.train_csv)
     val_csv = materialize_tabular_as_csv(args.val_csv)
     test_csv = materialize_tabular_as_csv(args.test_csv)
+    dropped = {}
+    filtered = []
+    for split, csv in (("train", train_csv), ("val", val_csv), ("test", test_csv)):
+        csv, dropped[split] = drop_unknown_residue_rows(csv, args.sequence_col, out_dir / "filtered_inputs" / f"{split}.csv")
+        filtered.append(csv)
+    train_csv, val_csv, test_csv = filtered
+    print(f"[bench] rows dropped for residues outside the original vocabulary: {dropped}", flush=True)
     protein_records_path = INLINE_PROTEIN_SENTINEL
     install_bench_patches(sequence_col=args.sequence_col, uniprot_id_col=args.uniprot_id_col)
     install_model_speed_patches()
     install_amp_patches(args.mixed_precision)
     install_optimizer_patches(args.optimizer_fused)
-    install_scheduler_patches(args.lr_scheduler)
-    install_training_control_patches(
-        val_every_n_epochs=args.val_every_n_epochs,
-        final_epoch_metrics_only=args.final_epoch_metrics_only,
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_min_delta=args.early_stopping_min_delta,
-        skip_native_test_eval=args.skip_native_test_eval,
-        cache_batch_graphs=args.cache_batch_graphs,
-    )
-    install_dataloader_patches(
-        pin_memory=not args.disable_pin_memory and "cuda" in str(args.device).lower(),
-        persistent_workers=not args.disable_persistent_workers,
-        prefetch_factor=args.prefetch_factor,
-        smart_batching=args.smart_batching,
-        bucket_multiplier=args.bucket_multiplier,
-        low_ram_mode=effective_low_ram_mode,
-        cache_batch_graphs=args.cache_batch_graphs,
-    )
+    install_training_control_patches()
 
     from catpred.args import TrainArgs
     from catpred.args import PredictArgs
@@ -317,47 +286,9 @@ def main():
     args.test_csv = test_csv
     args.protein_records_path = protein_records_path
 
-    skip_molgraph_memory_load = bool(args.cache_batch_graphs and args.strict_precompute)
     if not args.disable_molgraph_disk_cache:
-        train_cache_file = molgraph_cache_path(train_csv, args.cache_dir)
-        val_cache_file = molgraph_cache_path(val_csv, args.cache_dir)
-        test_cache_file = molgraph_cache_path(test_csv, args.cache_dir)
-
-        if args.strict_precompute and not (train_cache_file.exists() and val_cache_file.exists() and test_cache_file.exists()):
-            missing = [
-                str(path)
-                for path in (train_cache_file, val_cache_file, test_cache_file)
-                if not path.exists()
-            ]
-            raise FileNotFoundError(
-                "Missing precomputed MolGraph cache while --strict_precompute is enabled. "
-                f"Missing: {missing}. Run emulator_bench/precompute_features.py first."
-            )
-
-        if skip_molgraph_memory_load:
-            loaded_train = loaded_val = loaded_test = 0
-            loaded_note = "skipped_memory_load=batch_graph_cache_strict"
-        else:
-            loaded_train = load_molgraph_cache(train_csv, args.smiles_columns, args.cache_dir)
-            loaded_val = load_molgraph_cache(val_csv, args.smiles_columns, args.cache_dir)
-            loaded_test = load_molgraph_cache(test_csv, args.smiles_columns, args.cache_dir)
-            loaded_note = f"loaded train={loaded_train} val={loaded_val} test={loaded_test}"
-        print(
-            "[bench] molgraph_cache "
-            f"files train={'hit' if train_cache_file.exists() else 'miss'} "
-            f"val={'hit' if val_cache_file.exists() else 'miss'} "
-            f"test={'hit' if test_cache_file.exists() else 'miss'} | "
-            f"{loaded_note}",
-            flush=True,
-        )
-
-        if not args.strict_precompute and not skip_molgraph_memory_load and (loaded_train + loaded_val + loaded_test) == 0:
-            warmed = warm_molgraph_cache(
-                [train_csv, val_csv, test_csv],
-                args.smiles_columns,
-                args.cache_dir,
-            )
-            print(f"[bench] molgraph_cache warmup created={warmed}", flush=True)
+        loaded = [load_molgraph_cache(csv, args.smiles_columns, args.cache_dir) for csv in (train_csv, val_csv, test_csv)]
+        print(f"[bench] molgraph_cache loaded train={loaded[0]} val={loaded[1]} test={loaded[2]}", flush=True)
 
     train_argv = build_catpred_train_argv(args) + passthrough
     old_argv = sys.argv[:]
@@ -370,17 +301,9 @@ def main():
         _run_single_training(parsed_args, run_training)
     finally:
         sys.argv = old_argv
-        if not args.disable_molgraph_disk_cache and not skip_molgraph_memory_load:
-            saved_train = save_molgraph_cache(train_csv, args.smiles_columns, args.cache_dir)
-            saved_val = save_molgraph_cache(val_csv, args.smiles_columns, args.cache_dir)
-            saved_test = save_molgraph_cache(test_csv, args.smiles_columns, args.cache_dir)
-            print(
-                "[bench] molgraph_cache "
-                f"saved train={saved_train} val={saved_val} test={saved_test}",
-                flush=True,
-            )
-        elif skip_molgraph_memory_load:
-            print("[bench] molgraph_cache saved skipped=batch_graph_cache_strict", flush=True)
+        if not args.disable_molgraph_disk_cache:
+            saved = [save_molgraph_cache(csv, args.smiles_columns, args.cache_dir) for csv in (train_csv, val_csv, test_csv)]
+            print(f"[bench] molgraph_cache saved train={saved[0]} val={saved[1]} test={saved[2]}", flush=True)
 
     ckpt_dir = _checkpoint_dir(out_dir)
     write_json(out_dir / "bestmodel_dir.json", {"checkpoint_dir": str(ckpt_dir)})
@@ -447,6 +370,7 @@ def main():
         "seed": args.seed,
         "checkpoint_dir": str(ckpt_dir),
         "elapsed_seconds": time.time() - start,
+        **{f"dropped_unknown_residue_{split}": count for split, count in dropped.items()},
     }
     for split_name, metrics in split_metrics.items():
         for metric_name, metric_value in metrics.items():

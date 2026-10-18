@@ -84,14 +84,14 @@ def _configure_esm_warm_model(gpu_id: int | None):
     return model, batch_converter
 
 
-def _embed_esm_batch(sequences: list[str], gpu_id: int | None = None) -> list[torch.Tensor]:
+def _embed_esm(sequence: str, gpu_id: int | None = None) -> torch.Tensor:
+    """One sequence per forward call, as in catpred.data.esm_utils.get_single_esm_repr."""
     ensure_repo_on_path()
     from catpred.data import esm_utils as esm_mod
 
     model, batch_converter = _configure_esm_warm_model(gpu_id)
 
-    data = [("protein", seq) for seq in sequences]
-    _labels, _strs, batch_tokens = batch_converter(data)
+    _labels, _strs, batch_tokens = batch_converter([("protein", sequence)])
     batch_tokens = batch_tokens[:, : esm_mod.ESM_MAX_LENGTH]
 
     if not esm_mod.PROTEIN_EMBED_USE_CPU:
@@ -100,19 +100,14 @@ def _embed_esm_batch(sequences: list[str], gpu_id: int | None = None) -> list[to
     with torch.no_grad():
         results = model(batch_tokens, repr_layers=[33])
 
-    reps = results["representations"][33]
-    out = []
-    for i, seq in enumerate(sequences):
-        seq_len = min(len(seq), esm_mod.ESM_MAX_LENGTH)
-        out.append(reps[i][1 : seq_len + 1].detach().cpu().to(dtype=torch.float32))
-    return out
+    seq_len = min(len(sequence), esm_mod.ESM_MAX_LENGTH)
+    return results["representations"][33][0][1 : seq_len + 1].detach().cpu().to(dtype=torch.float32)
 
 
 def _warm_missing_entries(
     missing: list[tuple[str, str]],
     *,
     cache_dir: str,
-    batch_size: int,
     sequence_max_length: int,
     gpu_id: int | None = None,
     worker_label: str = "main",
@@ -122,9 +117,6 @@ def _warm_missing_entries(
         print(f"[cache:{worker_label}] no missing entries assigned", flush=True)
         return
 
-    current_batch = max(1, int(batch_size))
-    warmed = 0
-    idx = 0
     missing_total = len(missing)
     total_display = total_count if total_count is not None else missing_total
     device_msg = "cpu"
@@ -132,30 +124,12 @@ def _warm_missing_entries(
         device_msg = f"cuda:{gpu_id}" if gpu_id is not None else "cuda:auto"
     print(
         f"[cache:{worker_label}] warming missing ESM entries: {missing_total}/{total_display} "
-        f"(batch_size={current_batch}, sequence_max_length={sequence_max_length}, device={device_msg})",
+        f"(sequence_max_length={sequence_max_length}, device={device_msg})",
         flush=True,
     )
 
-    while idx < missing_total:
-        chunk = missing[idx : idx + current_batch]
-        seqs = [seq for _pid, seq in chunk]
-        try:
-            batch_embeddings = _embed_esm_batch(seqs, gpu_id=gpu_id)
-        except RuntimeError as exc:
-            msg = str(exc).lower()
-            if "out of memory" in msg and current_batch > 1:
-                current_batch = max(1, current_batch // 2)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print(f"[cache:{worker_label}] OOM during warmup, reducing batch_size to {current_batch}", flush=True)
-                continue
-            raise
-
-        for (_pid, seq), emb in zip(chunk, batch_embeddings):
-            save_cached_esm(seq, emb, cache_dir=cache_dir)
-
-        idx += len(chunk)
-        warmed += len(chunk)
+    for warmed, (_pid, seq) in enumerate(missing, start=1):
+        save_cached_esm(seq, _embed_esm(seq, gpu_id=gpu_id), cache_dir=cache_dir)
         if warmed % 100 == 0 or warmed == missing_total:
             print(f"[cache:{worker_label}] warmed {warmed}/{missing_total} assigned", flush=True)
 
@@ -164,7 +138,6 @@ def _run_parallel_esm_workers(
     missing: list[tuple[str, str]],
     *,
     cache_dir: str,
-    batch_size: int,
     sequence_max_length: int,
     gpu_ids: list[int],
 ):
@@ -174,7 +147,6 @@ def _run_parallel_esm_workers(
         _warm_missing_entries(
             missing,
             cache_dir=cache_dir,
-            batch_size=batch_size,
             sequence_max_length=sequence_max_length,
             gpu_id=gpu_id,
             worker_label="main",
@@ -202,7 +174,6 @@ def _run_parallel_esm_workers(
                 "--_warm_esm_worker_gpu", "0",
                 "--_warm_esm_worker_label", f"gpu{gpu_id}",
                 "--cache_dir", cache_dir,
-                "--esm_warm_batch_size", str(batch_size),
                 "--sequence_max_length", str(sequence_max_length),
             ]
             procs.append((gpu_id, subprocess.Popen(cmd, env=env, cwd=str(Path(__file__).resolve().parents[1]))))
@@ -223,7 +194,6 @@ def warm_esm_cache(
     sequence_col: str,
     uniprot_id_col: str,
     cache_dir: str,
-    batch_size: int = 64,
     sequence_max_length: int = 2048,
     esm_warm_gpu_ids: list[int] | None = None,
 ):
@@ -246,7 +216,6 @@ def warm_esm_cache(
         _run_parallel_esm_workers(
             missing,
             cache_dir=cache_dir,
-            batch_size=batch_size,
             sequence_max_length=sequence_max_length,
             gpu_ids=gpu_ids,
         )
@@ -257,7 +226,6 @@ def warm_esm_cache(
     _warm_missing_entries(
         missing,
         cache_dir=cache_dir,
-        batch_size=batch_size,
         sequence_max_length=sequence_max_length,
         gpu_id=gpu_id,
         worker_label="main",
@@ -271,7 +239,6 @@ def warm_esm_cache_allow_missing(
     sequence_col: str,
     uniprot_id_col: str,
     cache_dir: str,
-    batch_size: int = 64,
     sequence_max_length: int = 2048,
     esm_warm_gpu_ids: list[int] | None = None,
 ):
@@ -284,7 +251,6 @@ def warm_esm_cache_allow_missing(
             sequence_col,
             uniprot_id_col,
             cache_dir,
-            batch_size=batch_size,
             sequence_max_length=sequence_max_length,
             esm_warm_gpu_ids=esm_warm_gpu_ids,
         )
@@ -302,7 +268,6 @@ def main():
         parser.add_argument("--_warm_esm_worker_gpu", default=None, type=int)
         parser.add_argument("--_warm_esm_worker_label", default="worker", type=str)
         parser.add_argument("--cache_dir", required=True, type=str)
-        parser.add_argument("--esm_warm_batch_size", default=64, type=int)
         parser.add_argument("--sequence_max_length", default=2048, type=int)
         args, _ = parser.parse_known_args()
         maybe_set_cache_env(args.cache_dir)
@@ -312,7 +277,6 @@ def main():
         _warm_missing_entries(
             shard,
             cache_dir=args.cache_dir,
-            batch_size=args.esm_warm_batch_size,
             sequence_max_length=args.sequence_max_length,
             gpu_id=args._warm_esm_worker_gpu,
             worker_label=args._warm_esm_worker_label,
@@ -330,7 +294,6 @@ def main():
     parser.add_argument("--uniprot_id_col", default="uniprot_id", type=str)
     parser.add_argument("--cache_dir", default=default_cache_dir(), type=str)
     parser.add_argument("--warm_esm_cache", action="store_true")
-    parser.add_argument("--esm_warm_batch_size", default=64, type=int)
     parser.add_argument("--esm_warm_gpus", nargs="*", default=None, type=int)
     parser.add_argument("--sequence_max_length", default=2048, type=int)
     parser.add_argument("--overwrite_esm_cache", action="store_true")
@@ -355,7 +318,6 @@ def main():
                 args.sequence_col,
                 args.uniprot_id_col,
                 args.cache_dir,
-                batch_size=args.esm_warm_batch_size,
                 sequence_max_length=args.sequence_max_length,
                 esm_warm_gpu_ids=esm_warm_gpu_ids,
             )
@@ -389,7 +351,6 @@ def main():
             args.sequence_col,
             args.uniprot_id_col,
             args.cache_dir,
-            batch_size=args.esm_warm_batch_size,
             sequence_max_length=args.sequence_max_length,
             esm_warm_gpu_ids=esm_warm_gpu_ids,
         )

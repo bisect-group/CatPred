@@ -9,12 +9,12 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 
 def resolve_mixed_precision(device: torch.device, mode: str = "auto"):

@@ -5,16 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_VENDOR_PATH = (
-    REPO_ROOT.parent
-    / "EMULaToR"
-    / "data"
-    / "processed"
-    / "baselines"
-    / "CatPred"
-    / "embeddings"
-    / "fair_esm"
-)
+DEFAULT_VENDOR_PATH = REPO_ROOT.parents[1] / "outputs" / "baselines" / "CatPred" / "embeddings" / "fair_esm"
 
 
 def _vendor_path() -> Path:

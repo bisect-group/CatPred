@@ -1,10 +1,8 @@
 import argparse
 import ast
 import concurrent.futures
-import json
 import os
 import re
-import shutil
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List
@@ -14,12 +12,12 @@ from Bio.Align import PairwiseAligner
 from Bio.PDB import PDBParser, is_aa
 from Bio.SeqUtils import seq1
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
@@ -30,9 +28,12 @@ if str(HERE) not in sys.path:
 from common import (  # noqa: E402
     DEFAULT_SPLIT_GROUPS,
     DEFAULT_VALUE_TYPES,
+    EMULATOR_ROOT,
+    ENZYME_FEATURES,
     KEY_COLUMNS,
     STRUCTURE_COLUMNS,
     default_base_dir,
+    default_data_root,
     discover_split_jobs,
     load_json,
     read_table,
@@ -43,9 +44,9 @@ from common import (  # noqa: E402
 )
 
 
-DEFAULT_EXPERIMENTAL_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/processed_exp_pdb")
-DEFAULT_ALPHAFOLD_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/alphafold")
-DEFAULT_ESM_PDB_DIR = Path("/home/adhil/github/EMULaToR/data/intermediate/esm")
+DEFAULT_EXPERIMENTAL_PDB_DIR = EMULATOR_ROOT / "data" / "intermediate" / "processed_exp_pdb"
+DEFAULT_ALPHAFOLD_PDB_DIR = EMULATOR_ROOT / "data" / "intermediate" / "alphafold"
+DEFAULT_ESM_PDB_DIR = EMULATOR_ROOT / "data" / "intermediate" / "esmfold2_pdb"
 PDB_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])([0-9][A-Za-z0-9]{3})(?![A-Za-z0-9])")
 
 
@@ -168,13 +169,7 @@ def _build_esm_index(directory: Path) -> Dict[str, str]:
     directory = Path(directory).expanduser()
     if not directory.exists():
         return {}
-    out = {}
-    prefix = "ESM3-open-small-"
-    for path in directory.glob(f"{prefix}*.pdb"):
-        key = path.name[len(prefix) : -len(".pdb")]
-        out[key] = str(path.resolve())
-        out[key.upper()] = str(path.resolve())
-    return out
+    return {path.stem[len("ESMFold2-") :].upper(): str(path.resolve()) for path in directory.glob("ESMFold2-*.pdb")}
 
 
 def _extract_pdb_sequences(path: str) -> List[dict]:
@@ -246,11 +241,7 @@ def _collect_needed_keys(jobs: list[dict], limit_rows: int | None) -> dict[str, 
     for job in jobs:
         bucket = needed.setdefault(job["value_type"], {"keys": set(), "sequence_keys": set()})
         for split_key in ("train_path", "val_path", "test_path"):
-            frame = read_table(job[split_key])
-            rows = frame.to_dict("records")
-            if limit_rows:
-                rows = rows[:limit_rows]
-            for row in rows:
+            for row in read_split(Path(job[split_key]), limit_rows).to_dict("records"):
                 bucket["keys"].add(_row_key(row))
                 bucket["sequence_keys"].add(_sequence_key(row))
     return needed
@@ -309,7 +300,7 @@ def _resolve_structure(
 ) -> dict:
     sequence = _norm_seq(row.get("sequence", ""))
     best = {"pdbs": "", "chain_id": "", "identity": -1.0, "path": ""}
-    alpha_accessions, esm_keys = [], []
+    alpha_accessions = []
 
     for candidate in candidates:
         pdbs = _norm_text(candidate.get("pdbs"))
@@ -333,10 +324,6 @@ def _resolve_structure(
             accession = _base_accession(pdbs)
             if accession in alphafold_index:
                 alpha_accessions.append(accession)
-        else:
-            for key in (pdbs, _base_accession(pdbs), pdbs.upper()):
-                if key in esm_index:
-                    esm_keys.append(key)
 
     if best["path"] and best["identity"] >= identity_threshold:
         structure_id = f"PDBe:{best['pdbs']}:{best['chain_id']}"
@@ -368,8 +355,8 @@ def _resolve_structure(
             "resolved_structure_reason": "no_qualifying_experimental_match",
         }
 
-    if esm_keys:
-        key = sorted(set(esm_keys))[0]
+    key = _norm_text(row.get("uniprot_id")).upper()
+    if key in esm_index:
         return {
             "pdbs": key,
             "pdb_source": "ESM",
@@ -397,21 +384,10 @@ def _resolve_structure(
     }
 
 
-def _backup_path(path: Path, backup_root: Path) -> Path:
-    resolved = path.resolve()
-    rel = Path(*resolved.parts[1:]) if resolved.is_absolute() else resolved
-    return backup_root / rel
-
-
-def _update_split_file(path: Path, frame: pd.DataFrame, dry_run: bool, overwrite: bool, backup_root: Path) -> None:
-    if dry_run:
-        return
-
-    backup = _backup_path(path, backup_root)
-    if not backup.exists():
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, backup)
-    write_table_atomic(frame, path)
+def read_split(path: Path, limit_rows: int | None) -> pd.DataFrame:
+    frame = read_table(path)
+    _require_columns(frame, ["smiles", "sequence", "log10_value"], path)
+    return frame.head(int(limit_rows)) if limit_rows else frame
 
 
 def _align_one_file(
@@ -425,13 +401,8 @@ def _align_one_file(
     identity_threshold: float,
     limit_rows: int | None,
 ) -> tuple[pd.DataFrame, dict]:
-    frame = read_table(path)
-    _require_columns(frame, ["smiles", "sequence", "log10_value"], path)
-    rows = frame.to_dict("records")
-    if limit_rows:
-        rows_to_resolve = rows[: int(limit_rows)]
-    else:
-        rows_to_resolve = rows
+    frame = read_split(path, limit_rows)
+    rows_to_resolve = frame.to_dict("records")
 
     aligner = _make_aligner()
     resolved = []
@@ -487,123 +458,143 @@ def _align_one_file(
     }
 
 
+def _stage_plain(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+    frame["catpred_structure_id"] = frame["uniprot_id"]
+    return frame
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Align one best structure per CatPred split row and update split parquet/CSV files.")
-    parser.add_argument("--base_dir", default=str(default_base_dir()), type=str)
+    parser = argparse.ArgumentParser(
+        description="Copy the dataset splits into the work tree. Splits of E-GNN tasks also get one aligned structure per row."
+    )
+    parser.add_argument("--data_root", default=str(default_data_root()), type=str, help="Folder with <value_type>/<split_group>/... inputs. Read only.")
+    parser.add_argument("--base_dir", default=str(default_base_dir()), type=str, help="Work tree that receives the staged splits.")
     parser.add_argument("--value_types", nargs="+", default=list(DEFAULT_VALUE_TYPES))
     parser.add_argument("--split_groups", nargs="+", default=list(DEFAULT_SPLIT_GROUPS))
     parser.add_argument("--thresholds", nargs="+", default=None)
+    parser.add_argument(
+        "--structure_value_types",
+        nargs="+",
+        default=[vt for vt, kind in ENZYME_FEATURES.items() if kind == "egnn"],
+        help="Value types that need aligned structures.",
+    )
     parser.add_argument("--experimental_pdb_dir", default=str(DEFAULT_EXPERIMENTAL_PDB_DIR), type=str)
     parser.add_argument("--alphafold_pdb_dir", default=str(DEFAULT_ALPHAFOLD_PDB_DIR), type=str)
     parser.add_argument("--esm_pdb_dir", default=str(DEFAULT_ESM_PDB_DIR), type=str)
     parser.add_argument("--identity_threshold", default=90.0, type=float)
     parser.add_argument("--workers", default=max(1, (os.cpu_count() or 8) // 2), type=int)
-    parser.add_argument("--limit_rows", default=None, type=int)
+    parser.add_argument("--limit_rows", default=None, type=int, help="Stage only the first N rows of each split (smoke tests).")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
+    data_root = Path(args.data_root).expanduser().resolve()
     base_dir = Path(args.base_dir).expanduser().resolve()
-    backup_root = base_dir / "_aligned_pdb_backups"
+    if base_dir == data_root or data_root in base_dir.parents:
+        raise ValueError(f"--base_dir must be outside the dataset tree: {base_dir}")
     cache_root = base_dir / "_structure_alignment_cache"
-    cache_root.mkdir(parents=True, exist_ok=True)
 
     jobs = discover_split_jobs(
-        base_dir=base_dir,
+        base_dir=data_root,
         value_types=args.value_types,
         split_groups=args.split_groups,
         thresholds=args.thresholds,
     )
     if not jobs:
-        raise RuntimeError(f"No split jobs discovered under {base_dir}")
+        raise RuntimeError(f"No split jobs discovered under {data_root}")
+    structure_jobs = [job for job in jobs if job["value_type"] in args.structure_value_types]
 
-    experimental_index = _build_experimental_index(Path(args.experimental_pdb_dir))
-    alphafold_index = _build_alphafold_index(Path(args.alphafold_pdb_dir))
-    esm_index = _build_esm_index(Path(args.esm_pdb_dir))
-    print(
-        "[align] structure indexes "
-        f"PDBe={len(experimental_index)} AlphaFold={len(alphafold_index)} ESM={len(esm_index)}",
-        flush=True,
-    )
-
-    manifests = []
-    needed_by_value = _collect_needed_keys(jobs, args.limit_rows)
     lookups: dict[str, dict] = {}
-    for value_type in args.value_types:
-        value_root = base_dir / value_type
-        if value_root.exists():
-            needed = needed_by_value.get(value_type, {"keys": set(), "sequence_keys": set()})
+    sequence_cache = selection_cache = {}
+    selection_cache_path = cache_root / "selection_cache.json"
+    if structure_jobs:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        experimental_index = _build_experimental_index(Path(args.experimental_pdb_dir))
+        alphafold_index = _build_alphafold_index(Path(args.alphafold_pdb_dir))
+        esm_index = _build_esm_index(Path(args.esm_pdb_dir))
+        print(
+            "[align] structure indexes "
+            f"PDBe={len(experimental_index)} AlphaFold={len(alphafold_index)} ESM={len(esm_index)}",
+            flush=True,
+        )
+        needed_by_value = _collect_needed_keys(structure_jobs, args.limit_rows)
+        for value_type, needed in needed_by_value.items():
             lookups[value_type] = _candidate_lookup(
-                value_root,
+                data_root / value_type,
                 needed_keys=needed["keys"],
                 needed_sequence_keys=needed["sequence_keys"],
             )
 
-    all_needed = set()
-    for job in jobs:
-        lookup = lookups[job["value_type"]]
-        for split_key in ("train_path", "val_path", "test_path"):
-            frame = read_table(job[split_key])
-            rows = frame.to_dict("records")
-            if args.limit_rows:
-                rows = rows[: args.limit_rows]
-            all_needed.update(_needed_experimental_pdbs(rows, lookup, experimental_index))
+        all_needed = set()
+        for job in structure_jobs:
+            for split_key in ("train_path", "val_path", "test_path"):
+                rows = read_split(Path(job[split_key]), args.limit_rows).to_dict("records")
+                all_needed.update(_needed_experimental_pdbs(rows, lookups[job["value_type"]], experimental_index))
+        sequence_cache = _prefill_sequence_cache(
+            all_needed,
+            experimental_index,
+            cache_root / "pdb_sequence_cache.json",
+            workers=args.workers,
+        )
+        selection_cache = _load_json_default(selection_cache_path, {})
 
-    sequence_cache = _prefill_sequence_cache(
-        all_needed,
-        experimental_index,
-        cache_root / "pdb_sequence_cache.json",
-        workers=args.workers,
-    )
-    selection_cache_path = cache_root / "selection_cache.json"
-    selection_cache = _load_json_default(selection_cache_path, {})
-
-    for job in progress(jobs, desc="Update split files", unit="job"):
-        lookup = lookups[job["value_type"]]
+    manifests = []
+    for job in progress(jobs, desc="Stage splits", unit="job"):
         for split_key in ("train_path", "val_path", "test_path"):
-            path = Path(job[split_key])
-            existing_cols = set(tabular_columns(path))
-            if not args.overwrite and all(column in existing_cols for column in STRUCTURE_COLUMNS):
-                manifests.append({"path": str(path), "skipped": True, "reason": "structure_columns_exist"})
+            source = Path(job[split_key])
+            target = base_dir / source.relative_to(data_root)
+            stat = source.stat()
+            fingerprint = {
+                "source_size": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+                "limit_rows": args.limit_rows,
+                "identity_threshold": float(args.identity_threshold),
+                "structure": job["value_type"] in args.structure_value_types,
+            }
+            fingerprint_path = cache_root / "staged_fingerprints" / source.relative_to(data_root).with_suffix(".json")
+            if target.exists() and not args.overwrite and _load_json_default(fingerprint_path, None) == fingerprint:
+                manifests.append({"path": str(target), "skipped": True, "reason": "already_staged"})
                 continue
-            frame, summary = _align_one_file(
-                path,
-                lookup,
-                experimental_index,
-                alphafold_index,
-                esm_index,
-                sequence_cache,
-                selection_cache,
-                args.identity_threshold,
-                args.limit_rows,
-            )
+            if job["value_type"] in args.structure_value_types:
+                frame, summary = _align_one_file(
+                    source,
+                    lookups[job["value_type"]],
+                    experimental_index,
+                    alphafold_index,
+                    esm_index,
+                    sequence_cache,
+                    selection_cache,
+                    args.identity_threshold,
+                    args.limit_rows,
+                )
+            else:
+                frame = _stage_plain(read_split(source, args.limit_rows))
+                summary = {"path": str(source), "rows": int(len(frame))}
             summary.update(
                 {
                     "value_type": job["value_type"],
                     "split_group": job["split_group"],
                     "threshold": job["threshold"],
-                    "dry_run": bool(args.dry_run),
+                    "target": str(target),
                 }
             )
             manifests.append(summary)
-            _update_split_file(path, frame, args.dry_run, args.overwrite, backup_root)
-            if not args.dry_run and len(selection_cache) % 1000 < 20:
-                write_json(selection_cache_path, selection_cache)
+            write_table_atomic(frame, target)
+            write_json(fingerprint_path, fingerprint)
 
-    manifest = {
-        "base_dir": str(base_dir),
-        "jobs": len(jobs),
-        "identity_threshold": float(args.identity_threshold),
-        "dry_run": bool(args.dry_run),
-        "limit_rows": args.limit_rows,
-        "files": manifests,
-    }
-    write_json(cache_root / "alignment_manifest.json", manifest)
-    if not args.dry_run:
+    if structure_jobs:
         write_json(selection_cache_path, selection_cache)
-    print(f"[align] wrote manifest: {cache_root / 'alignment_manifest.json'}", flush=True)
-    if not args.dry_run:
-        print(f"[align] backups root: {backup_root}", flush=True)
+        write_json(
+            cache_root / "alignment_manifest.json",
+            {
+                "data_root": str(data_root),
+                "base_dir": str(base_dir),
+                "identity_threshold": float(args.identity_threshold),
+                "limit_rows": args.limit_rows,
+                "files": manifests,
+            },
+        )
+    print(f"[align] staged {len(manifests)} split files under {base_dir}", flush=True)
 
 
 if __name__ == "__main__":

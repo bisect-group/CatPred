@@ -9,7 +9,6 @@ import torch
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
 from bench_amp import install_amp_patches
-from bench_dataloader import install_dataloader_patches
 from bench_fast_loader import INLINE_PROTEIN_SENTINEL, install_bench_patches
 from bench_speedups import install_model_speed_patches
 from common import (
@@ -176,15 +175,12 @@ def main():
     parser.add_argument("--num_workers", default=4, type=int)
     parser.add_argument("--device", default="cuda:0", type=str)
     parser.add_argument("--cache_dir", default=default_cache_dir(), type=str)
-    parser.add_argument("--prefetch_factor", default=4, type=int)
-    parser.add_argument("--disable_pin_memory", action="store_true")
-    parser.add_argument("--disable_persistent_workers", action="store_true")
-    parser.add_argument("--mixed_precision", choices=["auto", "none", "bf16", "fp16"], default="auto")
+    parser.add_argument("--mixed_precision", choices=["auto", "none", "bf16", "fp16"], default="none")
     parser.add_argument("--overwrite_esm_cache", action="store_true")
     parser.add_argument("--require_cached_esm", action="store_true")
-    parser.add_argument("--disable_tf32", action="store_true")
+    parser.add_argument("--tf32", action="store_true")
     parser.add_argument("--sequence_col", default="sequence", type=str)
-    parser.add_argument("--uniprot_id_col", default="uniprot_id", type=str)
+    parser.add_argument("--uniprot_id_col", default="catpred_structure_id", type=str)
     parser.add_argument("--smiles_columns", nargs="+", default=["smiles"])
     parser.add_argument("--target_columns", nargs="+", default=["log10_value"])
     args = parser.parse_args()
@@ -195,17 +191,10 @@ def main():
         overwrite_esm_cache=args.overwrite_esm_cache,
         require_cached_esm=args.require_cached_esm,
     )
-    configure_torch_runtime(args.device, enable_tf32=not args.disable_tf32)
+    configure_torch_runtime(args.device, enable_tf32=args.tf32)
     install_bench_patches(sequence_col=args.sequence_col, uniprot_id_col=args.uniprot_id_col)
     install_model_speed_patches()
     install_amp_patches(args.mixed_precision)
-    install_dataloader_patches(
-        pin_memory=not args.disable_pin_memory and "cuda" in str(args.device).lower(),
-        persistent_workers=not args.disable_persistent_workers,
-        prefetch_factor=args.prefetch_factor,
-        smart_batching=False,
-        bucket_multiplier=50,
-    )
 
     pred_label_df, metrics, _task_names = evaluate_predictions_csv(
         input_csv=input_csv,

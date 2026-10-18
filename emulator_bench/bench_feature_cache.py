@@ -10,7 +10,7 @@ from common import default_cache_dir
 
 
 _MEM_CACHE = OrderedDict()
-_CACHE_VERSION = "esm2_t33_650M_UR50D_v1"
+_CACHE_VERSION = "esm2_t33_650M_UR50D_v2"
 _WARNED_RECOVERY_KEYS = set()
 
 

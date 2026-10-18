@@ -5,13 +5,13 @@ The split parquet files are treated as the source of truth, so missing result
 directories or partially written seed runs are reported instead of silently
 disappearing from the benchmark table.
 
-Default input:
-  ~/github/EMULaToR/data/processed/baselines/CatPred
+Default input (the work tree written by align_structures.py and the trainers):
+  <EMULaToR>/outputs/baselines/CatPred
 
-Default outputs:
-  ~/github/EMULaToR/data/processed/baselines/CatPred/aggregate_catpred_results.csv
-  ~/github/EMULaToR/data/processed/baselines/CatPred/catpred_seed_results.csv
-  ~/github/EMULaToR/data/processed/baselines/CatPred/catpred_missing_results.csv
+Default outputs (inside the input folder):
+  aggregate_catpred_results.csv (mean and std over seeds)
+  catpred_seed_results.csv
+  catpred_missing_results.csv
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from common import DEFAULT_SPLIT_GROUPS, DEFAULT_VALUE_TYPES, default_base_dir  
 
 
 TVT_SPLITS = ("train", "val", "test")
-DEFAULT_RUN_NAMES = ("paper_defaults_single_model",)
+DEFAULT_RUN_NAMES = ("original_defaults",)
 METRIC_ALIASES = {
     "rmse": ("RMSE", "rmse"),
     "mae": ("MAE", "mae"),
@@ -300,7 +300,7 @@ def aggregate(result_rows: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(result_rows)
     group_keys = ["value_type", "run_name", "split_group", "threshold", "split_name", "tvt_split"]
     present_metrics = [metric for metric in METRICS if metric in df.columns]
-    agg = df.groupby(group_keys, dropna=False)[present_metrics].agg(["mean", "var"])
+    agg = df.groupby(group_keys, dropna=False)[present_metrics].agg(["mean", "std"])
     agg.columns = [f"{metric}_{stat}" for metric, stat in agg.columns]
     grouped = df.groupby(group_keys, dropna=False)
     agg["n_seeds"] = grouped["seed"].nunique()

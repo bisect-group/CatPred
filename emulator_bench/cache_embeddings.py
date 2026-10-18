@@ -7,12 +7,12 @@ from pathlib import Path
 import pandas as pd
 import torch
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 
@@ -24,6 +24,7 @@ from build_tvt_data import warm_esm_cache_allow_missing  # noqa: E402
 from common import (  # noqa: E402
     DEFAULT_SPLIT_GROUPS,
     DEFAULT_VALUE_TYPES,
+    ENZYME_FEATURES,
     STRUCTURE_COLUMNS,
     default_base_dir,
     default_cache_dir,
@@ -46,19 +47,20 @@ def _norm(value) -> str:
     return "" if text.lower() in {"nan", "none", "null", "nat"} else text
 
 
-def _collect_split_paths(args) -> list[str]:
+def _collect_split_paths(args) -> dict[str, list[str]]:
+    """Split files per enzyme feature kind ("esm" or "egnn"), following ENZYME_FEATURES."""
     jobs = discover_split_jobs(
         base_dir=args.base_dir,
         value_types=args.value_types,
         split_groups=args.split_groups,
         thresholds=args.thresholds,
     )
-    paths = []
+    paths: dict[str, set[str]] = {"esm": set(), "egnn": set()}
     for job in jobs:
-        paths.extend([job["train_path"], job["val_path"], job["test_path"]])
-    if not paths:
-        raise RuntimeError(f"No split files discovered under {args.base_dir}")
-    return sorted(set(paths))
+        paths[ENZYME_FEATURES[job["value_type"]]].update([job["train_path"], job["val_path"], job["test_path"]])
+    if not any(paths.values()):
+        raise RuntimeError(f"No split files discovered under {args.base_dir}. Run align_structures.py first.")
+    return {kind: sorted(files) for kind, files in paths.items()}
 
 
 def _collect_structures(paths: list[str]) -> dict[str, str]:
@@ -97,7 +99,7 @@ def _run_progres(filepaths: Path, output: Path, device: str, overwrite: bool) ->
         return
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
-        "progres",
+        str(Path(sys.executable).parent / "progres"),
         "embed",
         "-l",
         str(filepaths),
@@ -135,23 +137,20 @@ def _convert_searchdb(searchdb: Path, output: Path, overwrite: bool) -> None:
 
 
 def _warm_esm(paths: list[str], args) -> None:
-    if not args.warm_esm:
-        return
     maybe_set_cache_env(args.cache_dir)
     warm_esm_cache_allow_missing(
         paths,
         sequence_col=args.sequence_col,
         uniprot_id_col=args.uniprot_id_col,
         cache_dir=args.cache_dir,
-        batch_size=args.esm_batch_size,
         sequence_max_length=args.sequence_max_length,
         esm_warm_gpu_ids=args.esm_gpus,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build one-time CatPred ESM2 and proGRES embedding caches.")
-    parser.add_argument("--base_dir", default=str(default_base_dir()), type=str)
+    parser = argparse.ArgumentParser(description="Build the one-time ESM2 (kcat, km) and proGRES (ki) embedding caches.")
+    parser.add_argument("--base_dir", default=str(default_base_dir()), type=str, help="Work tree written by align_structures.py.")
     parser.add_argument("--value_types", nargs="+", default=list(DEFAULT_VALUE_TYPES))
     parser.add_argument("--split_groups", nargs="+", default=list(DEFAULT_SPLIT_GROUPS))
     parser.add_argument("--thresholds", nargs="+", default=None)
@@ -159,10 +158,7 @@ def main() -> None:
     parser.add_argument("--sequence_col", default="sequence", type=str)
     parser.add_argument("--uniprot_id_col", default="catpred_structure_id", type=str)
     parser.add_argument("--sequence_max_length", default=2048, type=int)
-    parser.add_argument("--warm_esm", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--esm_batch_size", default=8, type=int)
     parser.add_argument("--esm_gpus", nargs="*", default=[0], type=int)
-    parser.add_argument("--warm_progres", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progres_device", default="cuda:0", type=str)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
@@ -175,27 +171,25 @@ def main() -> None:
     catpred_egnn = progres_dir / "progres_egnn_by_structure_id.pt"
 
     paths = _collect_split_paths(args)
+    print(f"[cache] esm_split_files={len(paths['esm'])} egnn_split_files={len(paths['egnn'])} cache_dir={cache_dir}", flush=True)
     if args.dry_run:
-        print(f"[cache] split_files={len(paths)} cache_dir={cache_dir}", flush=True)
-        print(f"[cache] would write {filepaths}")
-        print(f"[cache] would write {catpred_egnn}")
         return
 
-    structures = _collect_structures(paths)
-    print(f"[cache] split_files={len(paths)} unique_structures={len(structures)} cache_dir={cache_dir}", flush=True)
-
-    if args.warm_progres:
+    unique_structures = 0
+    if paths["egnn"]:
+        structures = _collect_structures(paths["egnn"])
+        unique_structures = len(structures)
         _write_progres_list(structures, filepaths)
         _run_progres(filepaths, searchdb, args.progres_device, args.overwrite)
         _convert_searchdb(searchdb, catpred_egnn, args.overwrite)
-
-    _warm_esm(paths, args)
+    if paths["esm"]:
+        _warm_esm(paths["esm"], args)
 
     write_json(
         cache_dir / "embedding_manifest.json",
         {
             "split_files": paths,
-            "unique_structures": len(structures),
+            "unique_structures": unique_structures,
             "progres_filepaths": str(filepaths),
             "progres_searchdb": str(searchdb),
             "pretrained_egnn_feats_path": str(catpred_egnn),
