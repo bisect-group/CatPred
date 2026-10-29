@@ -1,346 +1,107 @@
+"""Launch every CatPred run: kcat and km, all split folders found on disk, seeds 666 777 888.
+
+Each run is one train_run.py process with one GPU (CUDA_VISIBLE_DEVICES). A finished run is skipped when its settings match.
+Run order: task, then seed, then split folder, so each seed finishes on all splits early.
+"""
+
 import argparse
-import concurrent.futures
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+from queue import Empty, Queue
 
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.utils.rich_progress import progress  # noqa: E402
+from emulator_bench.common import SEEDS, SPLIT_GROUPS, TASKS, default_data_root, default_out_root, discover_split_jobs, esm_cache_dir  # noqa: E402
 
-from common import (  # noqa: E402
-    DEFAULT_SPLIT_GROUPS,
-    DEFAULT_VALUE_TYPES,
-    ENZYME_FEATURES,
-    DEFAULT_ENSEMBLE_SIZE,
-    DEFAULT_EPOCHS,
-    REPO_ROOT,
-    default_base_dir,
-    default_data_root,
-    discover_split_jobs,
-    maybe_set_cache_env,
-    run_is_current,
-    run_settings,
-    versioned_cache_dir,
-)
+from emulator_bench.cache_embeddings import unique_sequences  # noqa: E402
+from emulator_bench.esm_cache import sequence_key  # noqa: E402
 
-ALIGN_SCRIPT = HERE / "align_structures.py"
-CACHE_SCRIPT = HERE / "cache_embeddings.py"
-TRAIN_SCRIPT = HERE / "train_single_target_tvt.py"
-_ACTIVE_PROCESSES: dict[int, tuple[subprocess.Popen, str]] = {}
-_ACTIVE_LOCK = threading.Lock()
-_STOP_REQUESTED = threading.Event()
-
-
-def _parse_gpus(items) -> list[str]:
-    out = [part.strip() for item in items for part in str(item).split(",") if part.strip()]
-    return out or ["0"]
-
-
-def _handle_stop_signal(signum, _frame) -> None:
-    _STOP_REQUESTED.set()
-    raise KeyboardInterrupt(f"received signal {signum}")
-
-
-def _register_process(process: subprocess.Popen, label: str) -> None:
-    with _ACTIVE_LOCK:
-        _ACTIVE_PROCESSES[process.pid] = (process, label)
-
-
-def _unregister_process(process: subprocess.Popen) -> None:
-    with _ACTIVE_LOCK:
-        _ACTIVE_PROCESSES.pop(process.pid, None)
-
-
-def _terminate_process(process: subprocess.Popen, label: str, grace_seconds: float = 15.0) -> None:
-    if process.poll() is not None:
-        return
-    print(f"[stop] terminating {label} pid={process.pid}", flush=True)
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except Exception:
-        process.terminate()
-    try:
-        process.wait(timeout=grace_seconds)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    if process.poll() is None:
-        print(f"[stop] killing {label} pid={process.pid}", flush=True)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except Exception:
-            process.kill()
-        process.wait(timeout=5.0)
-
-
-def _terminate_active_processes() -> None:
-    with _ACTIVE_LOCK:
-        processes = list(_ACTIVE_PROCESSES.values())
-    for process, label in processes:
-        _terminate_process(process, label)
-
-
-def _run_subprocess(cmd: list[str], env: dict, label: str) -> None:
-    process = subprocess.Popen(
-        cmd,
-        cwd=str(REPO_ROOT),
-        env=env,
-        start_new_session=True,
-    )
-    _register_process(process, label)
-    try:
-        returncode = process.wait()
-    except KeyboardInterrupt:
-        _STOP_REQUESTED.set()
-        _terminate_process(process, label)
-        raise
-    finally:
-        _unregister_process(process)
-
-    if returncode != 0:
-        raise subprocess.CalledProcessError(returncode, cmd)
-
-
-def _run_step(cmd: list[str], env: dict, dry_run: bool, label: str) -> None:
-    print(f"[{label}] " + " ".join(cmd), flush=True)
-    if dry_run:
-        return
-    _run_subprocess(cmd, env, label)
-
-
-def _run_step(cmd: list[str], env: dict, dry_run: bool, label: str) -> None:
-    print(f"[{label}] " + " ".join(cmd), flush=True)
-    if dry_run:
-        return
-    _run_subprocess(cmd, env, label)
-
-
-def _scope_args(args) -> list[str]:
-    out = ["--base_dir", args.base_dir, "--value_types", *args.value_types, "--split_groups", *args.split_groups]
-    if args.thresholds:
-        out.extend(["--thresholds", *args.thresholds])
-    return out
-
-
-def _run_prepare_steps(args, gpus: list[str]) -> None:
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = gpus[0]
-    if not args.skip_align:
-        cmd = [
-            sys.executable, str(ALIGN_SCRIPT), *_scope_args(args),
-            "--data_root", args.data_root,
-            "--workers", str(args.align_workers),
-            "--identity_threshold", str(args.identity_threshold),
-        ]
-        if args.limit_rows:
-            cmd.extend(["--limit_rows", str(args.limit_rows)])
-        if args.overwrite_align:
-            cmd.append("--overwrite")
-        _run_step(cmd, env, args.dry_run, "align")
-    if not args.skip_embeddings:
-        cmd = [
-            sys.executable, str(CACHE_SCRIPT), *_scope_args(args),
-            "--cache_dir", args.cache_dir,
-            "--progres_device", "cuda:0",
-            "--esm_gpus", "0",
-        ]
-        if args.overwrite_embeddings:
-            cmd.append("--overwrite")
-        _run_step(cmd, env, args.dry_run, "embeddings")
-
-
-def _train_command(job: dict, seed: int, args) -> tuple[list[str], Path]:
-    split_name = "all" if job["threshold"] == "default" else job["threshold"]
-    out_dir = Path(args.base_dir) / job["value_type"] / job["split_group"] / split_name / f"seed_{seed}"
-    cmd = [
-        sys.executable, str(TRAIN_SCRIPT),
-        "--train_csv", job["train_path"],
-        "--val_csv", job["val_path"],
-        "--test_csv", job["test_path"],
-        "--out_dir", str(out_dir),
-        "--task_name", job["value_type"],
-        "--seed", str(seed),
-        "--num_workers", str(args.num_workers),
-        "--device", "cuda:0",
-        "--cache_dir", args.cache_dir,
-        "--mixed_precision", "bf16" if args.amp else "none",
-        "--resume_if_complete",
-        "--require_cached_esm",
-    ]
-    if args.epochs is not None:
-        cmd.extend(["--epochs", str(args.epochs)])
-    if args.ensemble_size is not None:
-        cmd.extend(["--ensemble_size", str(args.ensemble_size)])
-    if ENZYME_FEATURES[job["value_type"]] == "esm":
-        cmd.append("--add_esm_feats")
-    else:
-        cmd.extend(["--add_pretrained_egnn_feats", "--pretrained_egnn_feats_path", str(versioned_cache_dir(args.cache_dir, "progres") / "progres_egnn_by_structure_id.pt")])
-    return cmd, out_dir
-
-
-def _is_done(job: dict, out_dir: Path, args) -> bool:
-    splits = (job["train_path"], job["val_path"], job["test_path"])
-    settings = run_settings(args.epochs or DEFAULT_EPOCHS, args.ensemble_size or DEFAULT_ENSEMBLE_SIZE, splits)
-    return run_is_current(out_dir, settings)
-
-
-def _run_train_job(item) -> dict:
-    cmd, out_dir, gpu, env, gpu_semaphore, done = item
-    if _STOP_REQUESTED.is_set():
-        return {"out_dir": str(out_dir), "gpu": gpu, "status": "stopped_before_start"}
-    if done:
-        return {"out_dir": str(out_dir), "gpu": gpu, "status": "skipped_complete"}
-    env = dict(env)
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    label = f"train gpu={gpu} out={out_dir}"
-    gpu_semaphore.acquire()
-    try:
-        _run_subprocess(cmd, env, label)
-    except subprocess.CalledProcessError as exc:
-        returncode = int(exc.returncode)
-        result = {
-            "out_dir": str(out_dir),
-            "gpu": gpu,
-            "status": "failed",
-            "returncode": returncode,
-            "cmd": " ".join(str(part) for part in cmd),
-        }
-        if returncode < 0:
-            result["signal"] = -returncode
-            try:
-                result["signal_name"] = signal.Signals(-returncode).name
-            except ValueError:
-                result["signal_name"] = f"SIG{returncode * -1}"
-        return result
-    finally:
-        gpu_semaphore.release()
-    return {"out_dir": str(out_dir), "gpu": gpu, "status": "completed"}
+TRAIN_RUN = Path(__file__).with_name("train_run.py")
 
 
 def main() -> None:
-    signal.signal(signal.SIGTERM, _handle_stop_signal)
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--data_root", default=str(default_data_root()))
+    p.add_argument("--out_root", default=str(default_out_root()))
+    p.add_argument("--tasks", nargs="+", default=list(TASKS))
+    p.add_argument("--split_groups", nargs="+", default=list(SPLIT_GROUPS))
+    p.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
+    p.add_argument("--gpus", nargs="+", default=["0"], help="GPU ids. Each run gets one GPU.")
+    p.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent runs on each GPU.")
+    p.add_argument("--workers", type=int, default=3, help="Member processes inside each run. Does not change the result.")
+    p.add_argument("--amp", action="store_true", help="Deviation: bf16 autocast in the forward pass.")
+    p.add_argument("--tf32", action="store_true", help="Deviation: TF32 matmuls.")
+    p.add_argument("--fused_adam", action="store_true", help="Deviation: fused Adam.")
+    p.add_argument("--skip_pad", action="store_true", help="Deviation: skip padded positions in the first pooling layer (other rounding).")
+    p.add_argument("--compile", action="store_true", help="Deviation: torch.compile(dynamic=True) of the attentive pooling (same maths, other rounding).")
+    p.add_argument("--fused_attn", action="store_true", help="Deviation: Triton kernel for the attention core of the Seq-Attn block (same maths, other rounding, GPU only).")
+    p.add_argument("--attn_precision", choices=("ieee", "tf32", "bf16"), default="ieee", help="Dot products of --fused_attn. Only ieee keeps the exact maths.")
+    p.add_argument("--egnn_path", default=None, help="ProGRES dict from cache_structures.py. Adds structure features. Default: none.")
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--ensemble_size", type=int, default=10)
+    p.add_argument("--limit_rows", type=int, default=None, help="Smoke tests only: first N rows of each split.")
+    p.add_argument("--esm_dir", default=None, help="ESM cache folder. Default: the cache under --out_root.")
+    p.add_argument("--cpu", action="store_true", help="Smoke tests only.")
+    p.add_argument("--dry_run", action="store_true", help="List the runs and stop.")
+    a = p.parse_args()
 
-    parser = argparse.ArgumentParser(description="Run CatPred with its original settings for every seed, split and kinetic task.")
-    parser.add_argument("--data_root", default=str(default_data_root()), type=str, help="Read-only kinetic_dataset folder.")
-    parser.add_argument("--base_dir", default=str(default_base_dir()), type=str, help="Work tree for staged splits, caches and results.")
-    parser.add_argument("--value_types", nargs="+", default=list(DEFAULT_VALUE_TYPES))
-    parser.add_argument("--split_groups", nargs="+", default=list(DEFAULT_SPLIT_GROUPS))
-    parser.add_argument("--thresholds", nargs="+", default=None)
-    parser.add_argument("--gpus", nargs="+", default=["0"], help="Physical GPU ids, for example --gpus 0 1 or --gpus 0,1")
-    parser.add_argument("--runs_per_gpu", default=1, type=int, help="Concurrent training runs per GPU.")
-    parser.add_argument("--seeds", nargs="+", default=[666, 777, 888], type=int)
-    parser.add_argument("--cache_dir", default=None, type=str, help="Default: <base_dir>/embeddings.")
-    parser.add_argument("--epochs", default=None, type=int, help="Smoke tests only. Default is the original 30.")
-    parser.add_argument("--ensemble_size", default=None, type=int, help="Smoke tests only. Default is the original 10.")
-    parser.add_argument("--limit_rows", default=None, type=int, help="Smoke tests only. Stage the first N rows of each split.")
-    parser.add_argument("--num_workers", default=0, type=int)
-    parser.add_argument("--amp", action="store_true", help="Train with bf16 mixed precision (--mixed_precision bf16). Default: fp32, as in the original.")
-    parser.add_argument("--skip_align", action="store_true")
-    parser.add_argument("--skip_embeddings", action="store_true")
-    parser.add_argument("--overwrite_align", action="store_true")
-    parser.add_argument("--overwrite_embeddings", action="store_true")
-    parser.add_argument("--align_workers", default=max(1, (os.cpu_count() or 8) // 2), type=int)
-    parser.add_argument("--identity_threshold", default=90.0, type=float)
-    parser.add_argument("--fail_fast", action="store_true", help="Stop all active jobs after the first failed training subprocess.")
-    parser.add_argument("--dry_run", action="store_true")
-    args = parser.parse_args()
-
-    gpus = _parse_gpus(args.gpus)
-    args.data_root = str(Path(args.data_root).expanduser().resolve())
-    args.base_dir = str(Path(args.base_dir).expanduser().resolve())
-    args.cache_dir = str(Path(args.cache_dir or Path(args.base_dir) / "embeddings").expanduser().resolve())
-    maybe_set_cache_env(args.cache_dir)
-
-    _run_prepare_steps(args, gpus)
-
-    jobs = discover_split_jobs(
-        base_dir=args.base_dir,
-        value_types=args.value_types,
-        split_groups=args.split_groups,
-        thresholds=args.thresholds,
-    )
-    base_env = os.environ.copy()
-    per_gpu_limit = max(1, args.runs_per_gpu)
-    gpu_semaphores = {gpu: threading.BoundedSemaphore(per_gpu_limit) for gpu in gpus}
-    slots = gpus * per_gpu_limit
-    train_items = []
-    pending_jobs = 0
-    for job in jobs:
-        for seed in args.seeds:
-            cmd, out_dir = _train_command(job, seed, args)
-            done = _is_done(job, out_dir, args)
-            gpu = slots[(len(train_items) if done else pending_jobs) % len(slots)]
-            train_items.append((cmd, out_dir, gpu, base_env, gpu_semaphores[gpu], done))
-            pending_jobs += not done
-
-    print(f"[launch] train_jobs={len(train_items)} pending_jobs={pending_jobs} gpu_slots={slots}", flush=True)
-    if args.dry_run:
-        for cmd, _out_dir, gpu, _env, _sem, _done in train_items:
-            print(f"[gpu {gpu}] {' '.join(cmd)}")
+    out_root = Path(a.out_root).expanduser().resolve()
+    jobs = discover_split_jobs(Path(a.data_root), a.tasks, a.split_groups)
+    runs = [(job, seed) for task in a.tasks for seed in a.seeds for job in jobs if job.task == task]
+    flags = [f"--{f}" for f in ("amp", "tf32", "fused_adam", "skip_pad", "fused_attn", "compile", "cpu") if getattr(a, f)]
+    flags += ["--attn_precision", a.attn_precision] * (a.attn_precision != "ieee")
+    print(f"{len(runs)} runs: {len(jobs)} split folders x {len(a.seeds)} seeds, {a.ensemble_size} members x {a.epochs} epochs each")
+    for job, seed in runs:
+        print(f"  {job.run_dir(out_root, seed).relative_to(out_root)}")
+    esm_dir = Path(a.esm_dir) if a.esm_dir else esm_cache_dir(out_root)
+    cached = {k for f in esm_dir.glob("shard_*.json") for k in json.loads(f.read_text())["keys"]}
+    missing = sum(sequence_key(s) not in cached for s in unique_sequences(Path(a.data_root), a.tasks)[0])
+    if missing:
+        sys.exit(f"ESM cache in {esm_dir} lacks {missing} sequences. Run emulator_bench/cache_embeddings.py first.")
+    if a.egnn_path:
+        if not Path(a.egnn_path).expanduser().exists():
+            sys.exit(f"ProGRES dict {a.egnn_path} not found. Run emulator_bench/cache_structures.py first.")
+        flags += ["--egnn_path", str(Path(a.egnn_path).expanduser().resolve())]
+        print(f"structure features: {a.egnn_path}")
+    if a.dry_run:
         return
 
-    results = []
-    stopped = False
-    max_workers = len(slots)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-    futures = []
-    try:
-        futures = [executor.submit(_run_train_job, item) for item in train_items]
-        for future in progress(concurrent.futures.as_completed(futures), total=len(futures), desc="Retrain", unit="job"):
-            result = future.result()
-            results.append(result)
-            if result.get("status") == "failed":
-                print(
-                    "[launch] job failed "
-                    f"gpu={result.get('gpu')} out={result.get('out_dir')} "
-                    f"returncode={result.get('returncode')} "
-                    f"signal={result.get('signal_name', '')}",
-                    flush=True,
-                )
-                if args.fail_fast:
-                    stopped = True
-                    _STOP_REQUESTED.set()
-                    for pending in futures:
-                        pending.cancel()
-                    _terminate_active_processes()
-                    break
-        executor.shutdown(wait=True)
-    except KeyboardInterrupt:
-        stopped = True
-        _STOP_REQUESTED.set()
-        print("\n[launch] stop requested; terminating active training subprocesses...", flush=True)
-        for future in futures:
-            future.cancel()
-        _terminate_active_processes()
-        executor.shutdown(wait=False, cancel_futures=True)
-    except Exception:
-        _STOP_REQUESTED.set()
-        _terminate_active_processes()
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise
+    queue, failed = Queue(), []
+    for run in runs:
+        queue.put(run)
 
-    manifest_path = Path(args.base_dir) / "catpred_parallel_retrain_manifest.json"
-    with manifest_path.open("w", encoding="utf-8") as handle:
-        json.dump({"interrupted": stopped, "jobs": results}, handle, indent=2, sort_keys=True)
-    print(f"[launch] wrote manifest: {manifest_path}", flush=True)
-    failed_jobs = sum(1 for result in results if result.get("status") == "failed")
-    if failed_jobs:
-        print(f"[launch] failed_jobs={failed_jobs}; completed jobs remain resumable", flush=True)
-        raise SystemExit(1)
-    if stopped:
-        raise SystemExit(130)
+    def slot(gpu: str) -> None:
+        while True:
+            try:
+                job, seed = queue.get_nowait()
+            except Empty:
+                return
+            run_dir = job.run_dir(out_root, seed)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            cmd = [sys.executable, str(TRAIN_RUN), "--task", job.task, "--split_group", job.split_group, "--split_name", job.split_name,
+                   "--seed", str(seed), "--data_root", a.data_root, "--out_root", str(out_root), "--esm_dir", str(esm_dir),
+                   "--epochs", str(a.epochs), "--ensemble_size", str(a.ensemble_size), "--workers", str(a.workers), *flags]
+            if a.limit_rows:
+                cmd += ["--limit_rows", str(a.limit_rows)]
+            start = time.time()
+            with open(run_dir.parent / f"seed_{seed}.log", "a") as log:
+                code = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu}).returncode
+            print(f"[{time.strftime('%H:%M:%S')}] gpu {gpu} {run_dir.relative_to(out_root)} exit {code} after {time.time() - start:.0f}s", flush=True)
+            if code:
+                failed.append(run_dir)
+
+    threads = [threading.Thread(target=slot, args=(gpu,)) for gpu in a.gpus for _ in range(a.runs_per_gpu)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if failed:
+        sys.exit(f"{len(failed)} runs failed: {[str(f) for f in failed]}")
 
 
 if __name__ == "__main__":

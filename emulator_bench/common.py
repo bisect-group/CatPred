@@ -1,59 +1,30 @@
+"""Paths, split discovery and the amino-acid filter shared by all emulator_bench scripts."""
+
+import hashlib
 import json
 import os
-import hashlib
 import sys
-import csv
-import pickle
+from dataclasses import dataclass
 from pathlib import Path
-
-import pandas as pd
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EMULATOR_ROOT = REPO_ROOT.parents[1]
-DEFAULT_MODEL_NAME = "CatPred"
-CACHE_VERSION = 3
-DEFAULT_VALUE_TYPES = ("kcat", "km", "ki")
-DEFAULT_SPLIT_GROUPS = (
+MODEL_NAME = "CatPred"
+CACHE_VERSION = 4
+TASKS = ("kcat", "km")
+SEEDS = (666, 777, 888)
+SPLIT_GROUPS = (
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
     "enzyme_sequence_splits",
+    "enzyme_structure_splits",
     "substrate_splits",
+    "conformer_cosine_splits",
 )
-# Enzyme feature set of the released CatPred models: Seq-Attn + ESM2 for kcat and Km,
-# Seq-Attn + proGRES (E-GNN) for Ki (scripts/reproduce_fig5_catpred.sh).
-ENZYME_FEATURES = {"kcat": "esm", "km": "esm", "ki": "egnn"}
-KEY_COLUMNS = ("smiles", "sequence", "value", "smiles_hash", "uniprot_date", "log10_value")
-STRUCTURE_COLUMNS = (
-    "pdbs",
-    "pdb_source",
-    "pdb_type",
-    "structure_path",
-    "chain_id",
-    "catpred_structure_id",
-    "resolved_structure_status",
-    "resolved_structure_identity",
-    "resolved_structure_chain_id",
-    "resolved_structure_reason",
-)
-
-
-def default_data_root() -> Path:
-    """Kinetic dataset root that holds the kcat, km and ki split folders."""
-    return EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
-
-
-def default_base_dir() -> Path:
-    """Work tree with the staged splits, caches and results. Never inside the dataset tree."""
-    env_override = os.getenv("CATPRED_BENCH_BASE_DIR")
-    if env_override:
-        return Path(env_override).expanduser().resolve()
-    return EMULATOR_ROOT / "outputs" / "baselines" / DEFAULT_MODEL_NAME
-
-
-def default_embeddings_dir() -> Path:
-    return default_base_dir() / "embeddings"
+SEQUENCE_COL, SMILES_COL, TARGET_COL = "sequence", "smiles", "log10_value"
+# Residues that seq_to_tensor in catpred/models/model.py accepts. Any other letter raises KeyError there.
+ORIGINAL_AA_VOCAB = frozenset("ACDQKIPTFGHELRWVNYMS")
 
 
 def ensure_repo_on_path() -> None:
@@ -61,439 +32,61 @@ def ensure_repo_on_path() -> None:
         sys.path.insert(0, str(REPO_ROOT))
 
 
-def default_cache_dir() -> str:
-    env_override = os.getenv("CATPRED_BENCH_CACHE_DIR")
-    if env_override:
-        return str(Path(env_override).expanduser().resolve())
-
-    return str(default_embeddings_dir().resolve())
+def default_data_root() -> Path:
+    return EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset"
 
 
-def versioned_cache_dir(cache_dir: str | Path, name: str) -> Path:
-    """Cache folder whose name holds the cache version, so a bump builds a new cache."""
-    return Path(cache_dir) / f"{name}_v{CACHE_VERSION}"
+def default_out_root() -> Path:
+    return Path(os.getenv("CATPRED_BENCH_OUT_ROOT", EMULATOR_ROOT / "outputs" / "baselines" / MODEL_NAME)).expanduser().resolve()
+
+
+def esm_cache_dir(out_root: Path) -> Path:
+    return Path(out_root) / "embeddings" / f"esm2_t33_650M_UR50D_v{CACHE_VERSION}"
+
+
+def molgraph_cache_path(out_root: Path, task: str) -> Path:
+    return Path(out_root) / "embeddings" / f"molgraph_v{CACHE_VERSION}" / f"{task}.pkl"
+
+
+@dataclass(frozen=True)
+class SplitJob:
+    task: str
+    split_group: str
+    split_name: str  # "all" for a group without threshold folders
+    split_dir: Path
+
+    def paths(self) -> dict[str, Path]:
+        return {name: self.split_dir / f"{name}.parquet" for name in ("train", "val", "test")}
+
+    def run_dir(self, out_root: Path, seed: int) -> Path:
+        return Path(out_root) / self.task / self.split_group / self.split_name / f"seed_{seed}"
+
+
+def discover_split_jobs(data_root: Path | None = None, tasks=TASKS, split_groups=SPLIT_GROUPS) -> list[SplitJob]:
+    """Find every split folder on disk. Thresholds are never hardcoded."""
+    root = Path(data_root or default_data_root())
+    jobs = []
+    for task in tasks:
+        for group in split_groups:
+            group_dir = root / task / group
+            folders = [("all", group_dir)] if (group_dir / "train.parquet").exists() else []
+            folders += [(d.name, d) for d in sorted(group_dir.glob("threshold_*")) if (d / "train.parquet").exists()]
+            jobs += [SplitJob(task, group, name, folder) for name, folder in folders]
+    return jobs
+
+
+def unknown_residue_mask(sequences) -> "list[bool]":
+    """True for sequences with a residue outside the original 20-letter vocabulary."""
+    return [not set(str(seq)) <= ORIGINAL_AA_VOCAB for seq in sequences]
 
 
 def stable_hash(payload, length: int = 16) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:length]
 
 
-def read_table(path: str | Path, columns=None) -> pd.DataFrame:
-    return load_tabular_dataframe(path, usecols=columns)
-
-
-def write_table_atomic(df: pd.DataFrame, path: str | Path) -> None:
-    path = Path(path).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}{suffix}")
-    if suffix == ".parquet":
-        df.to_parquet(tmp_path, index=False)
-    elif suffix == ".csv":
-        df.to_csv(tmp_path, index=False)
-    else:
-        raise ValueError(f"Unsupported tabular format for {path}. Expected .csv or .parquet.")
-    os.replace(tmp_path, path)
-
-
-def normalize_threshold_args(raw_thresholds):
-    if raw_thresholds is None:
-        return None
-    if isinstance(raw_thresholds, str):
-        raw_thresholds = [item.strip() for item in raw_thresholds.split(",")]
-    thresholds = []
-    for item in raw_thresholds:
-        text = str(item).strip()
-        if text:
-            thresholds.append(text if text.startswith("threshold_") or text in {"default", "root", "all"} else f"threshold_{text}")
-    return thresholds or None
-
-
-def parse_list_arg(raw, default=None):
-    if raw is None:
-        return list(default or [])
-    if isinstance(raw, (list, tuple)):
-        out = []
-        for item in raw:
-            out.extend(parse_list_arg(item))
-        return out
-    return [item.strip() for item in str(raw).split(",") if item.strip()]
-
-
-def discover_split_jobs(base_dir: str | Path | None = None, value_types=None, split_groups=None, thresholds=None):
-    base = Path(base_dir or default_base_dir()).expanduser().resolve()
-    selected_values = parse_list_arg(value_types, DEFAULT_VALUE_TYPES)
-    selected_groups = parse_list_arg(split_groups, DEFAULT_SPLIT_GROUPS)
-    selected_thresholds = normalize_threshold_args(thresholds)
-
-    jobs = []
-    for value_type in selected_values:
-        value_root = base / value_type
-        if not value_root.exists():
-            continue
-        for split_group, threshold_name, threshold_dir in discover_threshold_dirs(
-            value_root,
-            selected_groups,
-            selected_thresholds,
-        ):
-            train_path, val_path, test_path = ensure_split_triplet(threshold_dir)
-            if not (train_path and val_path and test_path):
-                continue
-            jobs.append(
-                {
-                    "value_type": value_type,
-                    "split_group": split_group,
-                    "threshold": threshold_name,
-                    "threshold_dir": str(threshold_dir.resolve()),
-                    "train_path": str(Path(train_path).resolve()),
-                    "val_path": str(Path(val_path).resolve()),
-                    "test_path": str(Path(test_path).resolve()),
-                }
-            )
-    return jobs
-
-
-def discover_threshold_dirs(value_root: Path, split_groups, explicit_thresholds=None):
-    jobs = []
-    seen = set()
-    for split_group in split_groups:
-        split_root = value_root / split_group
-        if not split_root.exists():
-            continue
-
-        if explicit_thresholds:
-            threshold_dirs = []
-            for threshold_name in explicit_thresholds:
-                if threshold_name in {"default", "root", "all"}:
-                    threshold_dirs.append(split_root)
-                else:
-                    threshold_dirs.append(split_root / threshold_name)
-        else:
-            threshold_dirs = [split_root]
-            threshold_dirs.extend(
-                [
-                    p
-                    for p in sorted(split_root.iterdir())
-                    if p.is_dir() and (p.name.startswith("threshold_") or has_split_triplet(p))
-                ]
-            )
-
-        for threshold_dir in threshold_dirs:
-            if not threshold_dir.exists() or not has_split_triplet(threshold_dir):
-                continue
-            threshold_name = "default" if threshold_dir == split_root else threshold_dir.name
-            key = (split_group, threshold_name, str(threshold_dir.resolve()))
-            if key in seen:
-                continue
-            seen.add(key)
-            jobs.append((split_group, threshold_name, threshold_dir))
-
-    return jobs
-
-
-def split_file(threshold_dir: Path, split_name: str):
-    for ext in (".csv", ".parquet"):
-        candidate = threshold_dir / f"{split_name}{ext}"
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def has_split_triplet(threshold_dir: Path) -> bool:
-    return all(split_file(threshold_dir, name) is not None for name in ("train", "val", "test"))
-
-
-def ensure_split_triplet(threshold_dir: Path):
-    train_path = split_file(threshold_dir, "train")
-    val_path = split_file(threshold_dir, "val")
-    test_path = split_file(threshold_dir, "test")
-    return train_path, val_path, test_path
-
-
-def maybe_set_cache_env(cache_dir: str | None):
-    """Point the wrapper caches and upstream catpred's ESM cache into cache_dir. Call before catpred is imported."""
-    resolved = str(Path(cache_dir or default_cache_dir()).expanduser().resolve())
-    os.environ["CATPRED_CACHE_PATH"] = str(versioned_cache_dir(resolved, "catpred_esm"))
-    os.environ["CATPRED_BENCH_CACHE_DIR"] = resolved
-    os.environ["CATPRED_BENCH_TABULAR_CACHE_DIR"] = str(versioned_cache_dir(resolved, "tabular_csv"))
-
-
-# upstream catpred reads CATPRED_CACHE_PATH when it is imported, so set it before any catpred import.
-maybe_set_cache_env(None)
-
-
-def configure_esm_cache_policy(overwrite_esm_cache: bool = False, require_cached_esm: bool = False) -> None:
-    os.environ["CATPRED_BENCH_OVERWRITE_ESM"] = "1" if overwrite_esm_cache else "0"
-    os.environ["CATPRED_BENCH_REQUIRE_CACHED_ESM"] = "1" if require_cached_esm else "0"
-
-
-def _tabular_cache_root(cache_dir: str | None = None) -> Path:
-    root = cache_dir or os.getenv("CATPRED_BENCH_TABULAR_CACHE_DIR")
-    if root is None:
-        root = versioned_cache_dir(default_cache_dir(), "tabular_csv")
-    root = Path(root).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def materialize_tabular_as_csv(path: str | Path, cache_dir: str | None = None) -> str:
-    input_path = Path(path).expanduser().resolve()
-    suffix = input_path.suffix.lower()
-    if suffix == ".csv":
-        return str(input_path)
-    if suffix != ".parquet":
-        raise ValueError(f"Unsupported tabular format for {input_path}. Expected .csv or .parquet.")
-
-    stat = input_path.stat()
-    signature = f"{input_path}:{stat.st_size}:{stat.st_mtime_ns}"
-    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
-    out_path = _tabular_cache_root(cache_dir) / f"{input_path.stem}.{digest}.csv"
-    if out_path.exists():
-        return str(out_path)
-
-    df = pd.read_parquet(input_path)
-    tmp_path = out_path.with_suffix(".tmp.csv")
-    df.to_csv(tmp_path, index=False)
-    tmp_path.replace(out_path)
-    return str(out_path)
-
-
-# Residues accepted by seq_to_tensor in catpred/models/model.py. Any other letter raises KeyError there.
-ORIGINAL_AA_VOCAB = frozenset("ACDQKIPTFGHELRWVNYMS")
-
-
-def drop_unknown_residue_rows(csv_path: str | Path, sequence_col: str, out_path: Path) -> tuple[str, int]:
-    """Write the rows the original model can featurize to out_path. Return its path and the dropped row count."""
-    df = pd.read_csv(csv_path)
-    keep = df[sequence_col].map(lambda seq: set(str(seq).strip()) <= ORIGINAL_AA_VOCAB)
-    dropped = int((~keep).sum())
-    if dropped == 0:
-        return str(csv_path), 0
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df[keep].to_csv(out_path, index=False)
-    return str(out_path), dropped
-
-
-def load_tabular_dataframe(path: str | Path, usecols=None) -> pd.DataFrame:
-    input_path = Path(path).expanduser().resolve()
-    suffix = input_path.suffix.lower()
-    if suffix == ".csv":
-        return pd.read_csv(input_path, usecols=usecols)
-    if suffix == ".parquet":
-        return pd.read_parquet(input_path, columns=usecols)
-    raise ValueError(f"Unsupported tabular format for {input_path}. Expected .csv or .parquet.")
-
-
-def tabular_columns(path: str | Path):
-    input_path = Path(path).expanduser().resolve()
-    suffix = input_path.suffix.lower()
-    if suffix == ".csv":
-        with open(input_path) as f:
-            reader = csv.DictReader(f)
-            return list(reader.fieldnames or [])
-    if suffix == ".parquet":
-        return list(pd.read_parquet(input_path).columns)
-    raise ValueError(f"Unsupported tabular format for {input_path}. Expected .csv or .parquet.")
-
-
-def iter_tabular_rows(path: str | Path):
-    input_path = Path(path).expanduser().resolve()
-    if input_path.suffix.lower() == ".csv":
-        with open(input_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                yield row
-        return
-
-    df = load_tabular_dataframe(input_path)
-    for row in df.to_dict(orient="records"):
-        yield row
-
-
-def configure_torch_runtime(device: str, enable_tf32: bool = False) -> None:
-    if "cuda" not in str(device).lower():
-        return
-
-    import torch
-
-    if enable_tf32:
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("high")
-        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-            torch.backends.cuda.matmul.allow_tf32 = True
-        if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.allow_tf32 = True
-
-    if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.benchmark = True
-
-
-def configure_cpu_runtime(
-    num_threads: int | None = None,
-    interop_threads: int | None = None,
-) -> None:
-    import torch
-
-    if num_threads is not None:
-        value = max(1, int(num_threads))
-        for name in (
-            "OMP_NUM_THREADS",
-            "MKL_NUM_THREADS",
-            "OPENBLAS_NUM_THREADS",
-            "NUMEXPR_NUM_THREADS",
-            "VECLIB_MAXIMUM_THREADS",
-            "BLIS_NUM_THREADS",
-        ):
-            os.environ[name] = str(value)
-        torch.set_num_threads(value)
-
-    if interop_threads is not None:
-        value = max(1, int(interop_threads))
-        os.environ["TORCH_NUM_INTEROP_THREADS"] = str(value)
-        try:
-            torch.set_num_interop_threads(value)
-        except RuntimeError:
-            pass
-
-
-def load_json(path: Path):
-    with open(path) as f:
-        return json.load(f)
-
-
 def write_json(path: Path, payload) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(payload, f, indent=2)
-    tmp_path.replace(path)
-
-
-def file_signature(path: str | Path) -> str:
-    resolved = Path(path).expanduser().resolve()
-    stat = resolved.stat()
-    signature = f"{resolved}:{stat.st_size}:{stat.st_mtime_ns}"
-    return hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16]
-
-
-DEFAULT_EPOCHS = 30
-DEFAULT_ENSEMBLE_SIZE = 10
-
-
-def run_settings(epochs: int, ensemble_size: int, split_paths) -> dict:
-    """Settings that change a run's result; the staged split files carry the structure choice."""
-    return {"epochs": epochs, "ensemble_size": ensemble_size, "splits": [file_signature(path) for path in split_paths]}
-
-
-def run_is_current(out_dir: Path, settings: dict, marker_split: str = "test") -> bool:
-    """True when the run finished with these exact settings."""
-    settings_path = out_dir / "run_settings.json"
-    return (out_dir / f"final_results_{marker_split}.csv").exists() and settings_path.exists() and load_json(settings_path) == settings
-
-
-def _molgraph_cache_root(cache_dir: str | None = None) -> Path:
-    root = versioned_cache_dir(Path(cache_dir or default_cache_dir()).expanduser().resolve(), "molgraph")
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
-def molgraph_cache_path(csv_path: str | Path, cache_dir: str | None = None) -> Path:
-    """Return the expected on-disk MolGraph cache path for a split CSV."""
-    return _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
-
-
-def _collect_smiles_from_csv(csv_path: str | Path, smiles_columns: list[str]) -> set[str]:
-    smiles_set: set[str] = set()
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            for col in smiles_columns:
-                value = row.get(col)
-                if value is not None and value != "":
-                    smiles_set.add(str(value))
-    return smiles_set
-
-
-def load_molgraph_cache(csv_path: str | Path, smiles_columns: list[str], cache_dir: str | None = None) -> int:
-    """Load cached MolGraph objects for this CSV into catpred's in-memory graph cache."""
-    try:
-        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
-        if not cache_path.exists():
-            return 0
-
-        with open(cache_path, "rb") as f:
-            payload = pickle.load(f)
-
-        graph_map = payload.get("graphs", payload)
-        if not isinstance(graph_map, dict):
-            return 0
-
-        import catpred.data.data as data_module
-
-        loaded = 0
-        valid_smiles = _collect_smiles_from_csv(csv_path, smiles_columns)
-        for smiles, graph in graph_map.items():
-            if smiles in valid_smiles and smiles not in data_module.SMILES_TO_GRAPH:
-                data_module.SMILES_TO_GRAPH[smiles] = graph
-                loaded += 1
-        return loaded
-    except Exception:
-        return 0
-
-
-def save_molgraph_cache(csv_path: str | Path, smiles_columns: list[str], cache_dir: str | None = None) -> int:
-    """Persist MolGraph objects used by this CSV from catpred's in-memory graph cache."""
-    try:
-        import catpred.data.data as data_module
-
-        smiles_set = _collect_smiles_from_csv(csv_path, smiles_columns)
-        subset = {s: data_module.SMILES_TO_GRAPH[s] for s in smiles_set if s in data_module.SMILES_TO_GRAPH}
-        if len(subset) == 0:
-            return 0
-
-        cache_path = _molgraph_cache_root(cache_dir) / f"{Path(csv_path).stem}.{file_signature(csv_path)}.pkl"
-        tmp_path = cache_path.with_suffix(".tmp.pkl")
-        with open(tmp_path, "wb") as f:
-            pickle.dump({"graphs": subset}, f, protocol=pickle.HIGHEST_PROTOCOL)
-        tmp_path.replace(cache_path)
-        return len(subset)
-    except Exception:
-        return 0
-
-
-def warm_molgraph_cache(csv_paths: list[str], smiles_columns: list[str], cache_dir: str | None = None) -> int:
-    """Precompute MolGraph cache for given split files and persist to disk cache."""
-    try:
-        ensure_repo_on_path()
-        import catpred.data.data as data_module
-        from catpred.features import MolGraph
-        from catpred.rdkit import make_mol
-
-        created = 0
-        for csv_path in csv_paths:
-            for row in iter_tabular_rows(csv_path):
-                for col in smiles_columns:
-                    smiles = row.get(col)
-                    if smiles is None:
-                        continue
-                    smiles = str(smiles).strip()
-                    if smiles == "" or smiles in data_module.SMILES_TO_GRAPH:
-                        continue
-
-                    try:
-                        mol = make_mol(smiles, explicit_h=False, adding_h=False, keep_h=False)
-                    except TypeError:
-                        # Older signatures may use keeping_atom_map keyword.
-                        mol = make_mol(smiles, False, False, False)
-                    if mol is None:
-                        continue
-
-                    data_module.SMILES_TO_GRAPH[smiles] = MolGraph(mol)
-                    created += 1
-
-        for csv_path in csv_paths:
-            save_molgraph_cache(csv_path, smiles_columns, cache_dir)
-
-        return created
-    except Exception:
-        return 0
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp, path)

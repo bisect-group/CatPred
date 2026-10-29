@@ -1,28 +1,62 @@
-# CatPred EMULaToR bench commands. Run from the CatPred submodule root.
-PY=/home/adhil/.conda/envs/mldb/bin/python
-cd "$(git rev-parse --show-toplevel)/baselines/CatPred"
-export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+# CatPred EMULaToR bench commands. Run from the CatPred submodule root: cd <EMULaToR>/baselines/CatPred
+PY=/home/da24s023/miniforge3/envs/mldb/bin/python   # the mldb environment; no package is installed into it
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 0) One-time fair-esm install, isolated from the ESM3 package.
-$PY -m pip install fair-esm -t ../../outputs/baselines/CatPred/embeddings/fair_esm
+# 0) Tests against the original code (CPU, about 2 minutes), then the GPU tests (about 10 minutes).
+bash emulator_bench/verify_equivalence.sh
+bash emulator_bench/verify_equivalence.sh --gpu
 
-# 1) Dry run: stages nothing and lists the jobs.
-$PY emulator_bench/launch_parallel_retrain.py --dry_run
+# 1) ESM2 cache for all kcat and km sequences (done once; about 35 minutes with 2 processes; 68 GB).
+#    The first call also unpacks the pinned fair-esm wheel into outputs/baselines/CatPred/embeddings/fair_esm.
+$PY emulator_bench/cache_embeddings.py --shard 0 --num_shards 2 &
+$PY emulator_bench/cache_embeddings.py --shard 1 --num_shards 2 &
+wait
 
-# 2) Full run: seeds 666 777 888, all splits, kcat km ki, original settings.
-#    Stages the splits, builds the caches, trains, and resumes finished runs.
-$PY emulator_bench/launch_parallel_retrain.py --gpus 0 1
+# 1b) ProGRES structure vectors (done once; about 3 minutes; 25 MB). Picks one structure per sequence
+#     (experimental chain, AlphaFold, ESMFold2, ESM3), embeds it with progres 0.2.7 and writes
+#     outputs/baselines/CatPred/embeddings/progres_embeds/catpred_progres_embeds_dict.pt and structure_coverage.csv.
+#     The first call unpacks the pinned progres wheel and weights into outputs/baselines/CatPred/embeddings/progres.
+#     Structure folders default to <EMULaToR>/data/intermediate/{mmcif,alphafold,esmfold2_pdb,esm}. Use --esm3_dir etc. to change them.
+#     The dict can be built on one machine and copied to the other (the key is the sequence hash).
+EGNN=$(realpath ../../outputs)/baselines/CatPred/embeddings/progres_embeds/catpred_progres_embeds_dict.pt
+$PY emulator_bench/cache_structures.py --device cuda:0
 
-#    Multi-GPU: GPUs 0 1, two runs per GPU, bf16 mixed precision.
-$PY emulator_bench/launch_parallel_retrain.py --gpus 0 1 --runs_per_gpu 2 --amp
+# 2) Dry run: lists the 42 runs (2 tasks x 7 split folders x 3 seeds) and stops.
+$PY emulator_bench/launch_parallel_retrain.py --dry_run --egnn_path $EGNN --amp --skip_pad
 
-# 3) One task and one split, one seed.
-$PY emulator_bench/launch_parallel_retrain.py --gpus 0 --value_types kcat \
-  --split_groups random_splits_grouped_sequence --seeds 666
+# 3) Production (farm): 2 A10 GPUs, 1 run per GPU, 2 member processes per run (each process: 8.5 GB with --amp --skip_pad and
+#    structure features; 2 x 8.5 = 17 GB of the 22.5 GB per A10; 3 processes would need 25.5 GB). All 42 runs.
+#    --amp, --skip_pad and --egnn_path change the numbers (see REPORT.md); they are part of the run settings.
+#    Resumes finished runs and finished members. Run it in a detached screen with a log file.
+screen -dmS catpred bash -c "$PY emulator_bench/launch_parallel_retrain.py --gpus 0 1 --workers 2 --amp --skip_pad --egnn_path $EGNN > outputs_catpred_launch.log 2>&1"
+#    Check the step rate on the A10 first (item 7). If one process already fills the GPU, --workers 1 is as fast.
+#    Exact settings (no --amp, no --skip_pad) are bit-equal to the original code, with or without --egnn_path.
 
-# 4) Single steps.
-$PY emulator_bench/align_structures.py --value_types kcat km ki
-$PY emulator_bench/cache_embeddings.py --value_types kcat km ki
+# 4) One task, one split folder, one seed.
+$PY emulator_bench/launch_parallel_retrain.py --gpus 0 --tasks kcat --split_groups random_splits_grouped_sequence --seeds 666 \
+  --amp --skip_pad --egnn_path $EGNN
 
-# 5) Aggregate (mean and std over seeds).
-$PY emulator_bench/aggregate_catpred_results.py --seeds 666 777 888
+# 5) Result tables (mean and std over seeds).
+$PY emulator_bench/aggregate_catpred_results.py
+
+# 6) Smoke test: 64 rows per split, 1 epoch, 2 members, results in a scratch folder.
+$PY emulator_bench/launch_parallel_retrain.py --gpus 0 --tasks kcat --split_groups random_splits_grouped_sequence --seeds 666 \
+  --limit_rows 64 --epochs 1 --ensemble_size 2 --out_root /path/to/scratch --esm_dir outputs/baselines/CatPred/embeddings/esm2_t33_650M_UR50D_v4 \
+  --amp --skip_pad --egnn_path $EGNN
+
+# 7) Step rate on a real split (run when the GPU is free). Prints one JSON line per call.
+#    Add --egnn_path $EGNN for the structure features. Peak GPU memory is in the output (peak_gpu_gb allocated, reserved_gpu_gb).
+$PY emulator_bench/bench_speed.py --mode plain --run_dir /path/to/scratch/bench   # original loop
+$PY emulator_bench/bench_speed.py --mode fast --run_dir /path/to/scratch/bench --egnn_path $EGNN                     # exact, one process
+$PY emulator_bench/bench_speed.py --mode fast --run_dir /path/to/scratch/bench --egnn_path $EGNN --amp --skip_pad    # production options
+#    Drift of the options against the run-to-run noise floor (200 steps):
+$PY emulator_bench/bench_speed.py --mode drift --steps 200 --run_dir /path/to/scratch/bench --egnn_path $EGNN --amp --skip_pad
+
+# 8) Fused attention kernel (Triton, GPU only). Flags --fused_attn, --attn_precision {ieee,tf32,bf16}, --compile work in launch_parallel_retrain.py,
+#    train_run.py and bench_speed.py. Off by default. They enter run_settings.json only when used, so older run folders keep their settings.
+$PY emulator_bench/profile_step.py --run_dir /path/to/scratch/prof --egnn_path $EGNN --skip_pad --fused_attn     # share of kernel time per model part
+$PY emulator_bench/bench_attention.py                                                                          # attention block alone: original against the kernel, 3 precisions
+$PY emulator_bench/bench_speed.py --mode fast --run_dir /path/to/scratch/bench --egnn_path $EGNN --skip_pad --fused_attn
+$PY emulator_bench/bench_speed.py --mode drift --steps 200 --run_dir /path/to/scratch/bench --egnn_path $EGNN --skip_pad --fused_attn
+#    Production layout with the kernel (peak 1.1 GB per process, so more than 2 member processes fit on a 24 GB GPU):
+#    $PY emulator_bench/launch_parallel_retrain.py --gpus 0 1 --workers 4 --amp --skip_pad --fused_attn --egnn_path $EGNN

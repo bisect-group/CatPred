@@ -1,56 +1,84 @@
 # CatPred EMULaToR bench
 
 This folder runs CatPred with its original published settings on the EMULaToR kinetic splits.
-It does only multi-seed evaluation. The model, loss, features and hyperparameters are the original ones.
+It does only multi-seed evaluation. Tasks: `kcat` and `km`. Seeds: 666, 777, 888.
+The model, loss, features and hyperparameters are the original ones (`scripts/reproduce_fig5_catpred.sh`):
+Seq-Attn plus ESM2, 30 epochs, batch size 16, ensemble of 10, MVE loss, Noam schedule with 2 warmup epochs, fp32,
+best-validation-RMSE checkpoint for each member, sequence length 2048.
+One addition, by user decision: ProGRES structure vectors (128-d) join the ESM2 features through the original
+`--add_pretrained_egnn_feats` path, for kcat and Km. The released script uses them only for Ki.
+The production run also uses `--amp` and `--skip_pad` (see Speed).
 
-## Scope
+## Splits and runs
 
-- Tasks: `kcat`, `km`, `ki` from `data/processed/datasets/kinetic_dataset/<task>`. Unified datasets are never used.
-- Splits: `random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, `enzyme_sequence_splits/threshold_<t>`, `substrate_splits/threshold_<t>`. Thresholds come from disk.
-- Seeds: 666, 777, 888.
-- Enzyme features (as in `scripts/reproduce_fig5_catpred.sh`): Seq-Attn plus ESM2 for kcat and km. Seq-Attn plus proGRES (E-GNN) for ki.
-
-## Settings
-
-The defaults of `train_single_target_tvt.py` are the original ones: 30 epochs, batch size 16, ensemble of 10, MVE loss,
-Adam (init 1e-4, max 1e-3, final 1e-4, 2 warmup epochs, Noam schedule), dropout 0, seq_embed_dim 36, 6 attention heads,
-sequence length 2048, fp32. The best epoch is chosen by validation RMSE.
-
-## Work tree
-
-The dataset folder is read only. Staged splits, caches and results go in `--base_dir`
-(default `<EMULaToR>/outputs/baselines/CatPred`, or `CATPRED_BENCH_BASE_DIR`).
-
-- `<base_dir>/<task>/<split_group>[/threshold_<t>]/{train,val,test}.parquet`: staged splits with a structure column.
-- `<base_dir>/embeddings/esm2_t33_650M_UR50D_v3`: ESM2 tensors per unique sequence.
-- `<base_dir>/embeddings/progres_v3`: proGRES features per structure.
-- `<base_dir>/embeddings/{catpred_esm,molgraph,tabular_csv,dataset_inline}_v3`: other caches. `catpred_esm_v3` is the cache of the upstream `catpred` package. The wrapper sets `CATPRED_CACHE_PATH` to it before `catpred` is imported.
-- `<base_dir>/embeddings/fair_esm`: isolated Meta fair-esm install. Override with `CATPRED_FAIR_ESM_PATH`.
-- `<base_dir>/<task>/<split_group>/<split_name>/seed_<s>/`: results and checkpoints. `<split_name>` is `threshold_<t>`, or `all` for a split group without thresholds. `bestmodel.pth` is a copy of `model_0/model.pt`.
-- `<base_dir>/{aggregate_catpred_results,catpred_seed_results,catpred_missing_results}.csv`: summaries.
-
-The cache folder names hold the cache version (`CACHE_VERSION` in `common.py`). A version bump builds new caches.
-A direct run of `train_single_target_tvt.py` with a `--cache_dir` other than the default needs `CATPRED_BENCH_CACHE_DIR` set to the same folder.
+`launch_parallel_retrain.py` finds the split folders on disk under `data/processed/datasets/kinetic_dataset/<task>`:
+`random_splits_grouped_sequence`, `random_splits_grouped_smiles`, `uniprot_time_splits`, and the `threshold_*` folders of
+`enzyme_sequence_splits`, `enzyme_structure_splits`, `substrate_splits` and `conformer_cosine_splits`.
+That is 7 folders per task, 14 in all, and 42 runs with 3 seeds. The dataset tree is read only.
 
 ## Steps
 
-1. `align_structures.py` stages the splits and picks one structure per row (PDBe, then AlphaFold, then ESMFold2 fallback). Ki rows need a structure. Kcat and km use sequences only.
-2. `cache_embeddings.py` builds the ESM2 cache (kcat, km) and runs proGRES once (ki).
-3. `train_single_target_tvt.py` trains and evaluates one seed on one split.
-4. `launch_parallel_retrain.py` runs steps 1 to 3 for all seeds, splits and tasks. It can use several GPUs and resumes finished runs.
-5. `aggregate_catpred_results.py` writes mean and std over seeds.
+1. `cache_embeddings.py` builds the ESM2 cache once (all unique kcat and km sequences). It takes about 35 minutes with 2 processes on one GPU, and 68 GB of disk.
+2. `cache_structures.py` picks one structure per sequence, embeds it with progres 0.2.7 and writes the dict `catpred_progres_embeds_dict.pt` (about 3 minutes, 25 MB).
+3. `launch_parallel_retrain.py --egnn_path <dict>` starts one `train_run.py` process per run.
+4. `train_run.py` trains the 10 members of one run, writes the predictions and the metrics.
+5. `aggregate_catpred_results.py` rebuilds the result tables from the saved predictions.
 
-## Speed-ups that keep behaviour
+## Structures
 
-Inline data loading, ESM feature cache, a fused-Adam option and a faster ESM forward pass. These do not change the model or the settings.
-The ESM cache embeds one sequence per call, as the original does. Its folder name carries the cache version, so older caches (batch-padded) are not reused.
-The trainer runs the native per-member test predict, as the original does. It uses torch RNG, so skipping it would change later ensemble members. The `--skip_native_test_eval` flag is removed.
-Fused Adam is off by default (`--optimizer_fused off`) because it is not bit-identical to the original optimizer.
-Rows whose sequence has a residue outside the original vocabulary (the original raises `KeyError`) are dropped from every split. The counts are in `run_summary.csv` (`dropped_unknown_residue_*`).
-Mixed precision is off by default because the original code used fp32. The launcher flag `--amp` passes `--mixed_precision bf16` to the trainer. `--gpus 0 1` lists the GPUs, and `--runs_per_gpu N` sets the concurrent runs per GPU. `train_single_target_tvt.py` keeps `--mixed_precision {auto,none,bf16,fp16}`.
+One structure per unique sequence, in this order (same rule as the DEKP baseline):
+1. Experimental: the dataset row's `pdb_chain` in the mmCIF file (`mmcif/<ID>_updated.cif`), best `pdb_coverage` among the rows of the sequence in `<task>_kinetic_params_3d.parquet`. The chain is written to `structures/chains/<ID>_<chain>.pdb`.
+2. AlphaFold: `alphafold/AF-<accession>-F1-model_v<n>.pdb`, newest version.
+3. ESMFold2: `esmfold2_pdb/ESMFold2-<id>.pdb`.
+4. ESM3: `esm/ESM3-open-small-<id>.pdb`, only if the file exists.
 
-## Smoke tests
+`<id>` is the UniProt id with mutations (`P12345|A1B`) or the accession. The ESM3 files (955) live only on the farm in `data/intermediate/esm`;
+here they were copied to `outputs/baselines/CatPred/structures/esm`. Pass `--esm3_dir` if the folder is elsewhere.
+A sequence without a structure is not in the dict. The original model then gives it the mean vector (`pretrained_egnn_feats_avg`), and the row stays.
+The dict key is the sequence key (sha1) that the ESM cache also uses. The progres vectors are cached by sequence key and file fingerprint, so the build resumes and a changed structure file is embedded again.
+Coverage per task is in `structure_coverage.csv` and the chosen file for each sequence in `structure_table.csv` (both in `embeddings/progres_embeds`).
 
-`--limit_rows N`, `--epochs` and `--ensemble_size` on the launcher shrink a run. Do not use them for results.
+## Files
+
+- `fast_train.py`: the fast trainer. It uses the original model, loss, scheduler and data classes. See `REPORT.md` for what differs.
+- `esm_cache.py`: packed cache of per-residue ESM2 vectors.
+- `structures.py`: the structure rule and the mmCIF chain extraction. `cache_structures.py`: progres vectors and the dict. `progres_shim.py`: unpacks the pinned progres 0.2.7 wheel and weights.
+- `reference_run.py`: runs the original `run_training` for the tests and the benchmarks.
+- `bench_speed.py`: step rate of the original loop and of the fast trainer.
+- `verify_equivalence.sh`: tests against the original code (`../tests`). `--gpu` adds the GPU tests.
+
+## Work tree
+
+Default `<EMULaToR>/outputs/baselines/CatPred` (`--out_root` or `CATPRED_BENCH_OUT_ROOT`).
+
+- `embeddings/esm2_t33_650M_UR50D_v4`: ESM2 cache. The folder name holds the cache version (`CACHE_VERSION` in `common.py`).
+- `embeddings/fair_esm`: fair-esm 2.0.0, unpacked from the pinned wheel. It is never installed into the environment.
+- `embeddings/progres`: progres 0.2.7 (wheel sha256 checked) and its trained weights (sha256 checked), used through `sys.path`. Never installed.
+- `embeddings/progres_embeds`: `catpred_progres_embeds_dict.pt`, `vectors.jsonl` (resume cache), `structure_table.csv`, `structure_coverage.csv`, `manifest.json`.
+- `structures/chains`, `structures/esm`: extracted experimental chains and the copied ESM3 files.
+- `<task>/<split_group>/<split_name>/seed_<s>/`: one run. `split_name` is `threshold_<t>`, or `all` for a folder without thresholds.
+  - `model_<k>/model.pt`: best-validation checkpoint of member k (original format). `model_<k>/history.csv`: loss sum and validation RMSE per epoch.
+  - `pred_label_{train,val,test}.csv`, `final_results_{train,val,test}.csv`: ensemble predictions and metrics (log10 scale).
+  - `run_summary.csv`: metrics, best epochs, and the counts of dropped rows. `run_settings.json`: the settings of the run.
+  - `members/`: raw member results. `inputs/`: filtered split tables.
+- `<task>/<split_group>/<split_name>/seed_<s>.log`: log of the run.
+- `aggregate_catpred_results.csv`, `catpred_seed_results.csv`, `catpred_missing_results.csv`: summaries.
+
+A run with the same settings is skipped. A run stopped halfway resumes at the next member. Changed settings start a new run. The old run folder moves to `<run_dir>.old-<old settings id>-<time>` and is never deleted. With `--egnn_path`, the run fails if fewer than 98% of the rows of any split have a structure vector (`--min_hit_rate`). The rates are in `run_summary.csv`. Split files are compared by content hash. The launcher checks that the ESM cache holds every sequence.
+
+## Dropped rows
+
+Rows are dropped and counted in `run_summary.csv`. `dropped_unknown_residue_*` counts rows with a residue outside the 20-letter vocabulary
+(the original raises `KeyError`). `dropped_invalid_smiles_*` counts rows with a SMILES that has no heavy atom or does not parse
+(the original `get_data` drops them silently).
+
+## Speed
+
+The default path is exact: the maths of the original code, same batches, same inits.
+`--workers N` trains members in N processes on one GPU and does not change the result.
+`--tf32`, `--amp`, `--fused_adam` and `--skip_pad` change the numbers. They are off by default in the code. See `REPORT.md` for their speed and effect.
+`--skip_pad` keeps the maths (equal in float64 to 1e-15) and skips the ESM block of the first pooling layer at padded positions.
+`--fused_attn` runs the attention core of the Seq-Attn block as one Triton kernel (GPU only, off by default). With the default `--attn_precision ieee` it keeps the maths of `nn.MultiheadAttention` (fp32 dot products, no TF32; max error 4.6e-6 against float64 for L up to 2047, the float32 original gives 2.2e-6) and the peak GPU memory of one process falls from 6.9 to 1.1 GB. `--attn_precision tf32` or `bf16` change the numbers (see `REPORT.md` section 13). `--compile` compiles the attentive pooling with `torch.compile(dynamic=True)` (no gain measured). Without a CUDA device these flags stop with an error.
+The production command uses `--amp --skip_pad --egnn_path`. One process needs 8.5 GB of GPU memory, so a 24 GB A10 holds 2 member processes (`--workers 2`).
 
 See `commands.txt` for the commands.
