@@ -1,0 +1,38 @@
+# CatPred paper commands. Run from the submodule root. emulator_bench/run.sh runs steps 1 to 4.
+# Env: PY GPUS RUNS_PER_GPU SEEDS DATA_ROOT OUT_ROOT EMULATOR_ROOT CACHE_DEVICE. We used the conda env mldb.
+export PY=python PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+OUT=../../outputs/baselines/CatPred
+EGNN=$OUT/embeddings/progres_embeds/catpred_progres_embeds_dict.pt                    # kcat, km
+EGNN_KI=$OUT/embeddings/progres_embeds/catpred_progres_embeds_dict_kcat_km_ki.pt      # ki
+FLAGS="--workers 1 --ensemble_size 1 --skip_pad --fused_attn"                          # fp32, no --amp
+
+# 1) ESM2 cache for all sequences (about 35 minutes, 68 GB), then ProGRES structure vectors.
+#    kcat and km use the dict from the first call. Ki uses the tagged dict (it adds the Ki sequences).
+$PY emulator_bench/cache_embeddings.py --shard 0 --num_shards 2 &
+$PY emulator_bench/cache_embeddings.py --shard 1 --num_shards 2 &
+wait
+$PY emulator_bench/cache_structures.py --tasks kcat km --device cuda:0
+$PY emulator_bench/cache_structures.py --tasks kcat km ki --tag kcat_km_ki --device cuda:0
+
+# 2) Training and evaluation: kcat and km (14 split folders x 3 seeds), then Ki.
+$PY emulator_bench/launch_parallel_retrain.py --tasks kcat km --seeds 666 777 888 --gpus 1 2 3 --runs_per_gpu 4 $FLAGS --egnn_path $EGNN
+$PY emulator_bench/launch_parallel_retrain.py --tasks ki --seeds 666 777 888 --gpus 1 2 3 --runs_per_gpu 4 $FLAGS --egnn_path $EGNN_KI \
+  --split_groups random_splits_grouped_sequence random_splits_grouped_smiles enzyme_sequence_splits enzyme_structure_splits substrate_splits conformer_cosine_splits
+
+# 3) Ki uniprot_time_splits: 8% of test rows (viral polyproteins) have no structure, so --min_hit_rate 0.9.
+for s in 666 777 888; do
+  CUDA_VISIBLE_DEVICES=1 $PY emulator_bench/train_run.py --task ki --split_group uniprot_time_splits --split_name all --seed $s \
+    --esm_dir $OUT/embeddings/esm2_t33_650M_UR50D_v4 --epochs 30 $FLAGS --egnn_path $EGNN_KI --min_hit_rate 0.9
+done
+
+# 4) Result tables (mean and std over seeds).
+$PY emulator_bench/aggregate_catpred_results.py
+
+# Tests against the original code (CPU, about 2 minutes), then the GPU tests (about 10 minutes).
+bash emulator_bench/verify_equivalence.sh
+bash emulator_bench/verify_equivalence.sh --gpu
+
+# Smoke test: 64 rows per split, 1 epoch, 2 members, results in a scratch folder.
+$PY emulator_bench/launch_parallel_retrain.py --gpus 0 --tasks kcat --split_groups random_splits_grouped_sequence --seeds 666 \
+  --limit_rows 64 --epochs 1 --ensemble_size 2 --out_root /path/to/scratch --esm_dir $OUT/embeddings/esm2_t33_650M_UR50D_v4 \
+  --skip_pad --egnn_path $EGNN
